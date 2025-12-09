@@ -1,0 +1,49 @@
+ADMIN PANEL APIS
+=======================
+1- Get all active drivers.(Done) http://localhost:8000/eto/api/v1/driver/active
+
+2- Get total active rides. (Done) http://localhost:8000/eto/api/v1/rides/activeRides
+
+3- Get total earnings of all rides. (Done) http://localhost:8000/eto/api/v1/rides/totalEarnings
+
+4- Get admin total earning. (Done) http://localhost:8000/eto/api/v1/admin/totalEarning/673e31c7ee20fa51f8c2d2d8
+
+5- Get total register drivers. (Done) http://localhost:8000/eto/api/v1/driver
+
+6- Get total driver in current ride.(Done) http://localhost:8000/eto/api/v1/rides/all-driver/currentride
+
+7- Get Total rides.(Done) http://localhost:8000/eto/api/v1/rides/getTotalRides
+
+8- Get Driver registered time by userId. (Done) http://localhost:8000/eto/api/v1/driver/registered-time/67355a2b7201bc94434462a1
+
+9- Get driver by id for see profile. (Done) http://localhost:8000/eto/api/v1/driver/67355a2b7201bc94434462a1
+
+10- Get Admin profile by id. (Done) http://localhost:8000/eto/api/v1/admin/673e31c7ee20fa51f8c2d2d8
+
+11- Edit admin profile. (Done) http://localhost:8000/eto/api/v1/admin/update/673e31c7ee20fa51f8c2d2d8
+
+12- Get top drivers according to ride. (Done) http://localhost:8000/eto/api/v1/driver/topDrivers
+
+13- New Registered Driver request. (Done) http://localhost:8000/eto/api/v1/driver/newRegistered
+
+14- Show New driver profile and verify. (Done) http://localhost:8000/eto/api/v1/driver/67355b657201bc94434462af
+
+15- Driver approved status update.(Done) http://localhost:8000/eto/api/v1/driver/update/67355b657201bc94434462af
+
+16- Get Driver ride Details. (Done) http://localhost:8000/eto/api/v1/driver/rideDetails/67355b657201bc94434462af
+
+17- Pending All Due request. (Done) http://localhost:8000/eto/api/v1/dueRequest/pendingDueRequest
+
+18- Get Due request details by id. (Done) http://localhost:8000/eto/api/v1/dueRequest/getDueRequestDetails/123
+
+19- Update due request by id. (Done) http://localhost:8000/eto/api/v1/dueRequest/updateDueRequestStatus/123
+
+20- Delete due request by id. (Done) http://localhost:8000/eto/api/v1/dueRequest/delete/123
+
+USER PANEL NEW APIS
+=============================
+
+1- Create Due request. (Done) http://localhost:8000/eto/api/v1/dueRequest/createDueRequest
+
+2- Get Due request details. (Done) http://localhost:8000/eto/api/v1/dueRequest/getDueRequestDetails/123
+

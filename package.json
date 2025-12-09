@@ -1,0 +1,50 @@
+{
+  "name": "eto-backend",
+  "version": "1.0.0",
+  "description": "TOTO booking system",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon -r dotenv/config --experimental-json-modules src/index.js",
+    "start": "node src/index.js"
+  },
+  "keywords": [
+    "js",
+    "backend"
+  ],
+  "author": "subhojit dutta",
+  "license": "ISC",
+  "devDependencies": {
+    "nodemon": "^3.0.3",
+    "prettier": "^3.2.4"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "bcrypt": "^5.1.1",
+    "body-parser": "^1.20.3",
+    "bson": "^6.8.0",
+    "cloudinary": "^1.41.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.4.1",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.0",
+    "geolib": "^3.3.4",
+    "jsonwebtoken": "^9.0.2",
+    "moment-timezone": "^0.5.46",
+    "mongoose": "^8.1.1",
+    "mongoose-aggregate-paginate-v2": "^1.0.7",
+    "multer": "^1.4.5-lts.1",
+    "onesignal-node": "^3.4.0",
+    "request": "^2.88.2",
+    "sha256": "^0.2.0",
+    "simple-git": "^3.27.0",
+    "socket.io": "^4.7.5",
+    "twilio": "^5.3.0",
+    "uniqid": "^5.4.0"
+  },
+  "bin": {
+    "execute": "index.js"
+  }
+}

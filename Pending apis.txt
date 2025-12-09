@@ -1,0 +1,43 @@
+1. Create a Recent Rides API
+Create an API that, given a driver's ID , returns a maximum of 5 recent rides.(130)
+http://localhost:8000/eto/api/v1/driver/getRecentRides/67018e877fe337fffa4c0a02
+
+2. Create an API for Driver's Total Earnings Date-wise
+Create an API that returns the total earnings of the driver, filtered by date.(350) done
+http://localhost:8000/eto/api/v1/driver/getTotalEarningByDate
+
+paylaod:
+{
+    "driverId" :"67018e877fe337fffa4c0a02",
+    "startDate":"2024-10-25",
+    "endDate":"2024-10-30"
+}
+
+Response:
+{
+    "statusCode": 200,
+    "data": {
+        "totalEarnings": 326
+    },
+    "message": "Total earnings fetched successfully",
+    "success": true
+}
+
+
+
+3. Create an API for Driver's Total Withdrawals (Date-wise)
+Create an API that returns the total withdrawals made by the driver, filtered by date.(350) done
+http://localhost:8000/eto/api/v1/driver/getTotalWithdrawalsByDate
+
+paylaod
+{
+    "driverId" :"67018e877fe337fffa4c0a02",
+    "fromDate":"2024-10-27",
+    "toDate":"2024-11-30"
+}
+
+
+
+
+4. Create Withdrawl Logs and deduct money from driver collection from total_earning field minus it
+route 
