@@ -1694,6 +1694,3 @@ export const updateOneSignalPlayerId = asyncHandler(async (req, res) => {
     });
   }
 });
-
-
-// console.log("hello")

@@ -10,6 +10,8 @@ import { Admin } from "../models/admin.model.js";
 import { Khata } from "../models/khata.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import { ETOCard } from "../models/eto.model.js";
+import { FareSettings } from "../models/fareSettings.model.js";
+import { FranchiseCommissionSettings } from "../models/commissionSettings.model.js";
 
 dotenv.config({
   path: "./env",
@@ -17,17 +19,8 @@ dotenv.config({
 
 // Looking Drivers for Ride new functionality
 export const findAvailableDrivers = asyncHandler(async (req, res) => {
-  const { riderId, dropLocation, pickUpLocation } = req.body;
+  const { riderId, dropLocation, pickUpLocation, ride_start_time } = req.body;
   const proximityRadius = 5; // Search radius in kilometers
-
-  // ---- Fare Settings ----
-  const baseFare = 20; // Base fare for the ride hello
-  const perKmCharge = 8; // Charge per kilometer
-  const adminProfitPercentage = 18; // Admin's profit percentage - CHANGED TO 18%
-
-  // ---- Speed Settings ----
-  const minSpeed = 18; // km/h (worst case in traffic)
-  const maxSpeed = 30; // km/h (best case in traffic)
 
   if (!riderId || !pickUpLocation || !dropLocation) {
     return res
@@ -42,6 +35,33 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
   }
 
   try {
+    // 1. Get fare settings from FareSettings model
+    const fareSettings = await FareSettings.getSettings();
+    const baseFare = fareSettings.base_fare || 20;
+    const perKmCharge = fareSettings.per_km_charge || 8;
+
+    // Check for night surcharge
+    let nightSurchargeMultiplier = 1;
+    if (ride_start_time) {
+      const rideHour = new Date(ride_start_time).getHours();
+      const nightStart = fareSettings.night_start_hour || 22;
+      const nightEnd = fareSettings.night_end_hour || 6;
+
+      if (nightStart < nightEnd) {
+        // Normal case: night time doesn't cross midnight
+        if (rideHour >= nightStart && rideHour < nightEnd) {
+          nightSurchargeMultiplier =
+            1 + (fareSettings.night_surcharge_percentage || 20) / 100;
+        }
+      } else {
+        // Night time crosses midnight (e.g., 10 PM to 6 AM)
+        if (rideHour >= nightStart || rideHour < nightEnd) {
+          nightSurchargeMultiplier =
+            1 + (fareSettings.night_surcharge_percentage || 20) / 100;
+        }
+      }
+    }
+
     const rider = await Rider.findById(riderId);
     if (!rider) {
       return res
@@ -54,6 +74,7 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
       pickUpLocation.latitude,
     ];
 
+    // Find available drivers with their franchise info
     const availableDrivers = await Driver.find({
       current_location: {
         $near: {
@@ -64,7 +85,7 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
       isActive: true,
       is_on_ride: false,
       due_wallet: { $lt: 500 },
-    });
+    }).populate("franchiseId");
 
     if (availableDrivers.length === 0) {
       return res
@@ -88,6 +109,30 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
         { latitude: dropLocation.latitude, longitude: dropLocation.longitude }
       ) / 1000; // Convert meters to kilometers
 
+    // Get franchise commission settings for all franchises
+    const franchiseIds = availableDrivers
+      .filter(
+        (d) =>
+          d.franchiseId && d.franchiseId.isActive && d.franchiseId.isApproved
+      )
+      .map((d) => d.franchiseId._id);
+
+    let franchiseCommissionSettings = {};
+    if (franchiseIds.length > 0) {
+      const settings = await FranchiseCommissionSettings.find({
+        franchiseId: { $in: franchiseIds },
+        isActive: true,
+      });
+
+      settings.forEach((setting) => {
+        franchiseCommissionSettings[setting.franchiseId.toString()] = setting;
+      });
+    }
+
+    // ---- Speed Settings ----
+    const minSpeed = 18; // km/h (worst case in traffic)
+    const maxSpeed = 30; // km/h (best case in traffic)
+
     // Prepare response data for each available driver
     const resData = await Promise.all(
       availableDrivers.map(async (driver) => {
@@ -107,14 +152,58 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
         // Total distance for pricing (driver -> pickup + pickup -> drop)
         const totalDistance = driverDistanceToPickup + totalKmPickupToDrop;
 
-        // Fare Calculation
-        const totalPrice = Math.ceil(baseFare + totalDistance * perKmCharge);
+        // Fare Calculation with night surcharge
+        const baseFareAmount = baseFare;
+        const distanceCharge = totalDistance * perKmCharge;
+        let totalPrice = Math.ceil(baseFareAmount + distanceCharge);
 
-        // Profit Calculation - USING 18% FOR ADMIN
-        const adminProfit = Math.ceil(
-          (adminProfitPercentage / 100) * totalPrice
-        );
-        const driverProfit = Math.ceil(totalPrice - adminProfit);
+        // Apply night surcharge if applicable
+        totalPrice = Math.ceil(totalPrice * nightSurchargeMultiplier);
+
+        // Check if driver belongs to an active franchise
+        let adminCommissionRate = 18; // Default admin commission
+        let franchiseCommissionRate = 0;
+        let franchiseId = null;
+        let franchiseName = null;
+        let adminProfit = 0;
+        let franchiseProfit = 0;
+        let driverProfit = 0;
+        let hasFranchise = false;
+
+        if (
+          driver.franchiseId &&
+          driver.franchiseId.isActive &&
+          driver.franchiseId.isApproved
+        ) {
+          // Driver belongs to a franchise
+          hasFranchise = true;
+          franchiseId = driver.franchiseId._id;
+          franchiseName = driver.franchiseId.name;
+
+          // Get commission settings for this franchise
+          const commissionSettings =
+            franchiseCommissionSettings[franchiseId.toString()];
+
+          if (commissionSettings) {
+            adminCommissionRate = commissionSettings.admin_commission_rate;
+            franchiseCommissionRate =
+              commissionSettings.franchise_commission_rate;
+          } else {
+            // Use default franchise commission
+            franchiseCommissionRate = 10; // Default franchise commission
+          }
+
+          // Calculate profits with franchise commission
+          franchiseProfit = Math.ceil(
+            (franchiseCommissionRate / 100) * totalPrice
+          );
+          adminProfit = Math.ceil((adminCommissionRate / 100) * totalPrice);
+          driverProfit = Math.ceil(totalPrice - franchiseProfit - adminProfit);
+        } else {
+          // Driver does not belong to any franchise
+          adminProfit = Math.ceil((adminCommissionRate / 100) * totalPrice);
+          driverProfit = Math.ceil(totalPrice - adminProfit);
+        }
 
         // ETA Calculation (range)
         const minTimeToPickup = (driverDistanceToPickup / maxSpeed) * 60; // minutes
@@ -124,12 +213,39 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
           driverId: driver._id,
           location: driver.current_location.coordinates,
           name: driver.name,
+          phone: driver.phone,
+          hasFranchise: hasFranchise,
+          franchiseId: franchiseId,
+          franchiseName: franchiseName,
           distanceToPickup: driverDistanceToPickup.toFixed(2) + " km",
           estimatedTimeToPickup: `${minTimeToPickup.toFixed(
             2
           )} - ${maxTimeToPickup.toFixed(2)} mins`, // ETA Range
+          fareBreakdown: {
+            baseFare: baseFareAmount,
+            totalDistance: totalDistance.toFixed(2),
+            perKmCharge: perKmCharge,
+            distanceCharge: Math.ceil(distanceCharge),
+            nightSurchargeMultiplier: nightSurchargeMultiplier,
+            isNightTime: nightSurchargeMultiplier > 1,
+            nightSurchargePercentage:
+              nightSurchargeMultiplier > 1
+                ? fareSettings.night_surcharge_percentage || 20
+                : 0,
+          },
           totalPrice: totalPrice,
+          commissionBreakdown: {
+            adminCommissionRate: adminCommissionRate,
+            franchiseCommissionRate: franchiseCommissionRate,
+            adminProfit: adminProfit,
+            franchiseProfit: franchiseProfit,
+            driverProfit: driverProfit,
+          },
+          // Legacy fields for backward compatibility
+          adminPercentage: adminCommissionRate,
           adminProfit: adminProfit,
+          franchisePercentage: franchiseCommissionRate,
+          franchiseProfit: franchiseProfit,
           driverProfit: driverProfit,
         };
       })
@@ -137,6 +253,13 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
 
     const finalResData = {
       availableDrivers: resData,
+      fareSettings: {
+        base_fare: baseFare,
+        per_km_charge: perKmCharge,
+        night_surcharge_percentage:
+          fareSettings.night_surcharge_percentage || 20,
+        night_hours: `${fareSettings.night_start_hour || 22}:00 - ${fareSettings.night_end_hour || 6}:00`,
+      },
       totalKmPickupToDrop: totalKmPickupToDrop.toFixed(2) + " km",
       isAvailable: true,
     };
@@ -152,7 +275,7 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
   }
 });
 
-// Accept Ride request new api
+// Accept Ride request new api - Modified for franchise support
 export const acceptRide = (io) =>
   asyncHandler(async (req, res) => {
     const {
@@ -161,7 +284,12 @@ export const acceptRide = (io) =>
       dropLocation,
       pickup_location,
       totalKm,
-      totalPrice, // Pass totalPrice calculated from findAvailableDrivers2
+      totalPrice,
+      adminCommissionRate,
+      franchiseCommissionRate,
+      adminProfit,
+      franchiseProfit,
+      driverProfit,
     } = req.body;
 
     // Input validation
@@ -204,7 +332,7 @@ export const acceptRide = (io) =>
 
     try {
       const rider = await Rider.findById(riderId);
-      const driver = await Driver.findById(driverId);
+      const driver = await Driver.findById(driverId).populate("franchiseId");
 
       // Check existence of rider and driver
       if (!rider) {
@@ -230,11 +358,60 @@ export const acceptRide = (io) =>
           .json(new ApiResponse(400, null, "Driver is already on a ride"));
       }
 
-      // Calculate admin and driver profits based on the total price
-      // const adminPercentage = process.env.ADMIN_PERCENTAGE; // Admin percentage
-      const adminPercentage = 18; // Admin percentage
-      const adminAmount = Math.ceil((adminPercentage / 100) * totalPrice);
-      const driverProfit = Math.ceil(totalPrice - adminAmount);
+      // If commission rates and profits are not provided, calculate them
+      let finalAdminCommissionRate = adminCommissionRate || 18;
+      let finalFranchiseCommissionRate = franchiseCommissionRate || 0;
+      let finalAdminProfit = adminProfit || 0;
+      let finalFranchiseProfit = franchiseProfit || 0;
+      let finalDriverProfit = driverProfit || 0;
+      let franchiseId = null;
+
+      if (
+        driver.franchiseId &&
+        driver.franchiseId.isActive &&
+        driver.franchiseId.isApproved
+      ) {
+        // Driver belongs to a franchise
+        franchiseId = driver.franchiseId._id;
+
+        // If commission rates are not provided, get them from settings
+        if (!adminCommissionRate || !franchiseCommissionRate) {
+          const commissionSettings = await FranchiseCommissionSettings.findOne({
+            franchiseId: franchiseId,
+            isActive: true,
+          });
+
+          if (commissionSettings) {
+            finalAdminCommissionRate = commissionSettings.admin_commission_rate;
+            finalFranchiseCommissionRate =
+              commissionSettings.franchise_commission_rate;
+          } else {
+            finalFranchiseCommissionRate = 10; // Default franchise commission
+          }
+        }
+
+        // If profits are not provided, calculate them
+        if (!adminProfit || !franchiseProfit || !driverProfit) {
+          finalFranchiseProfit = Math.ceil(
+            (finalFranchiseCommissionRate / 100) * totalPrice
+          );
+          finalAdminProfit = Math.ceil(
+            (finalAdminCommissionRate / 100) * totalPrice
+          );
+          finalDriverProfit = Math.ceil(
+            totalPrice - finalFranchiseProfit - finalAdminProfit
+          );
+        }
+      } else {
+        // Driver does not belong to any franchise
+        // If profits are not provided, calculate them
+        if (!adminProfit || !driverProfit) {
+          finalAdminProfit = Math.ceil(
+            (finalAdminCommissionRate / 100) * totalPrice
+          );
+          finalDriverProfit = Math.ceil(totalPrice - finalAdminProfit);
+        }
+      }
 
       // Generate OTPs
       const pickupOtp = generateOtp();
@@ -265,18 +442,16 @@ export const acceptRide = (io) =>
         total_km: Number(totalKm),
         pickup_otp: pickupOtp,
         drop_otp: dropOtp,
-        total_amount: totalPrice, // Use totalPrice from findAvailableDrivers2
-        admin_percentage: adminPercentage,
-        admin_profit: adminAmount,
-        driver_profit: driverProfit,
+        total_amount: totalPrice,
+        admin_percentage: finalAdminCommissionRate,
+        admin_profit: finalAdminProfit,
+        driver_profit: finalDriverProfit,
+        franchiseId: franchiseId, // Add franchise reference
+        franchise_profit: finalFranchiseProfit, // Add franchise profit
+        franchise_commission_rate: finalFranchiseCommissionRate,
       });
 
       await newRide.save();
-
-      // await Driver.findByIdAndUpdate(
-      //   driverId,
-      //   { $inc: { total_earning: driverProfit } } // Increment total_earning by driverProfit
-      // );
 
       // Emit ride details to the rider and driver via Socket.IO
       if (rider.socketId) {
@@ -303,8 +478,10 @@ export const acceptRide = (io) =>
           pickupOtp,
           dropOtp,
           totalAmount: newRide.total_amount,
-          adminProfit: adminAmount,
-          driverProfit,
+          adminProfit: finalAdminProfit,
+          driverProfit: finalDriverProfit,
+          franchiseProfit: finalFranchiseProfit,
+          hasFranchise: !!franchiseId,
         });
       }
 
@@ -635,7 +812,7 @@ export const cancelRide = (io) =>
     }
   });
 
-// Update Payment Mode and Driver's Wallet
+// Update Payment Mode and Driver's Wallet - Modified for franchise support
 export const updatePaymentMode = (io) =>
   asyncHandler(async (req, res) => {
     const { rideId, paymentMode } = req.body;
@@ -655,11 +832,12 @@ export const updatePaymentMode = (io) =>
     }
 
     try {
-      // Fetch ride details
+      // Fetch ride details with franchise info
       const ride = await RideDetails.findById(rideId).populate([
         "driverId",
         "riderId",
         "adminId",
+        "franchiseId",
       ]);
 
       if (!ride) {
@@ -672,16 +850,64 @@ export const updatePaymentMode = (io) =>
         driverId,
         riderId,
         adminId,
+        franchiseId,
         total_amount,
         driver_profit,
         admin_profit,
+        franchise_profit = 0,
+        franchise_commission_rate = 0,
+        admin_percentage = 0,
       } = ride;
 
       // Fetch Driver, Admin, and Khata records
       const driver = await Driver.findById(driverId);
       const rider = await Rider.findById(riderId);
       const admin = await Admin.findById(adminId);
-      const khata = await Khata.findOne({ driverId, adminId });
+
+      // Find or create khata based on franchise status
+      let khata;
+
+      if (franchiseId) {
+        // Driver belongs to a franchise
+        khata = await Khata.findOne({
+          driverId,
+          franchiseId,
+          adminId,
+        });
+
+        if (!khata) {
+          // Create new khata for franchise driver
+          khata = new Khata({
+            driverId,
+            adminId,
+            franchiseId,
+            driverdue: 0,
+            admindue: 0,
+            franchisedue: 0,
+            due_payment_details: [],
+          });
+        }
+      } else {
+        // Driver does not belong to any franchise
+        khata = await Khata.findOne({
+          driverId,
+          adminId,
+          franchiseId: null,
+        });
+
+        if (!khata) {
+          // Create new khata for non-franchise driver
+          khata = new Khata({
+            driverId,
+            adminId,
+            franchiseId: null,
+            driverdue: 0,
+            admindue: 0,
+            franchisedue: 0,
+            due_payment_details: [],
+          });
+        }
+      }
 
       if (!rider) {
         return res
@@ -701,18 +927,6 @@ export const updatePaymentMode = (io) =>
           .json(new ApiResponse(404, null, "Admin not found"));
       }
 
-      if (!khata) {
-        return res
-          .status(404)
-          .json(
-            new ApiResponse(
-              404,
-              null,
-              "Khata not found for this driver-admin pair"
-            )
-          );
-      }
-
       // Update Ride Payment Mode
       ride.payment_mode = paymentMode;
       ride.isPayment_done = true;
@@ -725,7 +939,14 @@ export const updatePaymentMode = (io) =>
         driver.online_wallet += total_amount;
       }
 
-      driver.due_wallet += admin_profit;
+      // Update due wallet based on franchise status
+      if (franchiseId) {
+        // For franchise driver: due_wallet = admin_profit + franchise_profit
+        driver.due_wallet += admin_profit + franchise_profit;
+      } else {
+        // For non-franchise driver: due_wallet = admin_profit only
+        driver.due_wallet += admin_profit;
+      }
 
       // Update Driver's ride details
       driver.ride_details.push({
@@ -739,19 +960,40 @@ export const updatePaymentMode = (io) =>
         paymentMode,
       });
 
-      // Update Khata
+      // Update Khata based on franchise status
       khata.due_payment_details.push({
         driverId,
         rideId,
         total_price: total_amount,
         admin_profit,
         driver_profit,
+        franchise_profit: franchise_profit || 0,
+        franchise_commission_rate: franchise_commission_rate || 0,
+        admin_commission_rate: admin_percentage || 0,
         payment_mode: paymentMode,
       });
 
-      // Adjust driverdue and admindue in Khata
-      khata.driverdue += driver_profit; // Money owed by the driver increases
-      khata.admindue += admin_profit; // Money owed by the admin increases
+      // Adjust khata balances based on franchise status
+      if (franchiseId) {
+        // For franchise driver
+        khata.driverdue += driver_profit; // Money owed by the driver increases
+        khata.admindue += admin_profit; // Money owed by the admin increases
+        khata.franchisedue += franchise_profit; // Money owed to franchise increases
+
+        // Update franchise earnings if franchise exists
+        if (franchiseId && typeof franchiseId === "object") {
+          // Import Franchise model
+          const { Franchise } = await import("../models/franchise.model.js");
+          await Franchise.findByIdAndUpdate(franchiseId._id, {
+            $inc: { total_earnings: franchise_profit },
+          });
+        }
+      } else {
+        // For non-franchise driver
+        khata.driverdue += driver_profit; // Money owed by the driver increases
+        khata.admindue += admin_profit; // Money owed by the admin increases
+        // franchisedue remains 0 for non-franchise drivers
+      }
 
       await rider.save();
       await driver.save();
@@ -775,6 +1017,10 @@ export const updatePaymentMode = (io) =>
           message: "Payment mode updated successfully",
           rideId: ride._id,
           paymentMode,
+          hasFranchise: !!franchiseId,
+          franchiseProfit: franchise_profit || 0,
+          adminProfit: admin_profit,
+          driverProfit: driver_profit,
         });
       }
 

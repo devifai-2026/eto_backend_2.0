@@ -19,6 +19,19 @@ const rideDetailsSchema = new Schema(
       ref: "Rider",
       required: true,
     },
+    franchiseId: {
+      type: Schema.Types.ObjectId,
+      ref: "Franchise",
+      default: null,
+    },
+    franchise_profit: {
+      type: Number,
+      default: 0,
+    },
+    franchise_commission_rate: {
+      type: Number,
+      default: 0,
+    },
     driverNumber: {
       type: Number,
     },

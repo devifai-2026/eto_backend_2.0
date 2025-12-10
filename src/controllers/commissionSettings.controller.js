@@ -3,6 +3,7 @@ import { FranchiseCommissionSettings } from "../models/commissionSettings.model.
 import { Franchise } from "../models/franchise.model.js";
 import { Admin } from "../models/admin.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
+import { DueRequest } from "../models/dueRequest.model.js";
 
 // Get commission settings for a specific franchise
 export const getFranchiseCommissionSettings = asyncHandler(async (req, res) => {
@@ -140,6 +141,48 @@ export const updateFranchiseCommissionSettings = asyncHandler(
           .json(new ApiResponse(404, null, "Franchise not found"));
       }
 
+      // 1. Check if any driver under this franchise is currently on a ride
+      const activeRideDrivers = await Driver.find({
+        franchiseId,
+        is_on_ride: true,
+        isActive: true,
+      });
+
+      if (activeRideDrivers.length > 0) {
+        const driverNames = activeRideDrivers.map((d) => d.name).join(", ");
+        return res
+          .status(400)
+          .json(
+            new ApiResponse(
+              400,
+              {
+                activeDrivers: activeRideDrivers.map((d) => ({
+                  id: d._id,
+                  name: d.name,
+                })),
+              },
+              `Cannot update commission settings while drivers are on active rides: ${driverNames}`
+            )
+          );
+      }
+
+      // 2. Check for drivers with due requests or due balances
+      const driversWithDue = await Driver.find({
+        franchiseId,
+        $or: [{ due_wallet: { $gt: 0 } }],
+      });
+
+      const dueRequests = await DueRequest.find({
+        requestedBy: { $in: driversWithDue.map((d) => d._id) },
+        status: "pending",
+      }).populate("requestedBy", "name phone");
+
+      let warningMessage = "";
+      if (driversWithDue.length > 0 || dueRequests.length > 0) {
+        warningMessage =
+          "Warning: Some drivers have due balances or pending due requests. Commission changes will affect future rides only.";
+      }
+
       // Get or create commission settings
       let commissionSettings = await FranchiseCommissionSettings.findOne({
         franchiseId,
@@ -158,6 +201,12 @@ export const updateFranchiseCommissionSettings = asyncHandler(
 
       const updates = [];
       const responseData = {};
+
+      // Track old rates for khata update
+      const oldAdminRate = commissionSettings.admin_commission_rate;
+      const oldFranchiseRate = commissionSettings.franchise_commission_rate;
+      let newAdminRate = oldAdminRate;
+      let newFranchiseRate = oldFranchiseRate;
 
       // Update admin commission rate if provided
       if (admin_commission_rate !== undefined) {
@@ -191,6 +240,7 @@ export const updateFranchiseCommissionSettings = asyncHandler(
             new: admin_commission_rate,
           };
           commissionSettings.admin_commission_rate = admin_commission_rate;
+          newAdminRate = admin_commission_rate;
         }
       }
 
@@ -228,6 +278,7 @@ export const updateFranchiseCommissionSettings = asyncHandler(
           };
           commissionSettings.franchise_commission_rate =
             franchise_commission_rate;
+          newFranchiseRate = franchise_commission_rate;
         }
       }
 
@@ -247,24 +298,50 @@ export const updateFranchiseCommissionSettings = asyncHandler(
       commissionSettings.last_changed_by = admin._id;
       await commissionSettings.save();
 
+      // 3. Update Khata records for pending payments with new commission rates
+      if (
+        oldFranchiseRate !== newFranchiseRate ||
+        oldAdminRate !== newAdminRate
+      ) {
+        await updateKhataForFranchise(
+          franchiseId,
+          oldFranchiseRate,
+          newFranchiseRate,
+          oldAdminRate,
+          newAdminRate
+        );
+      }
+
       // Populate last_changed_by for response
       await commissionSettings.populate("last_changed_by", "name email");
 
-      return res.status(200).json(
-        new ApiResponse(
-          200,
-          {
-            franchise: {
-              _id: franchise._id,
-              name: franchise.name,
-            },
-            commission_settings: commissionSettings,
-            changes_made: responseData,
-            total_changes: updates.length,
-          },
-          "Franchise commission settings updated successfully"
-        )
-      );
+      const response = {
+        franchise: {
+          _id: franchise._id,
+          name: franchise.name,
+        },
+        commission_settings: commissionSettings,
+        changes_made: responseData,
+        total_changes: updates.length,
+        warnings: {
+          hasActiveRides: false,
+          hasDueIssues: driversWithDue.length > 0 || dueRequests.length > 0,
+          dueDriversCount: driversWithDue.length,
+          pendingRequestsCount: dueRequests.length,
+          message: warningMessage,
+        },
+      };
+
+      return res
+        .status(200)
+        .json(
+          new ApiResponse(
+            200,
+            response,
+            "Franchise commission settings updated successfully" +
+              (warningMessage ? ` (${warningMessage})` : "")
+          )
+        );
     } catch (error) {
       console.error(
         "Error updating franchise commission settings:",
@@ -283,7 +360,88 @@ export const updateFranchiseCommissionSettings = asyncHandler(
   }
 );
 
-// ✅ Get all franchises with their commission settings
+// Helper function to update Khata records when commission rates change
+async function updateKhataForFranchise(
+  franchiseId,
+  oldFranchiseRate,
+  newFranchiseRate,
+  oldAdminRate,
+  newAdminRate
+) {
+  try {
+    // Find all khatas for this franchise with pending payments
+    const khatas = await Khata.find({
+      franchiseId,
+      due_payment_details: { $exists: true, $not: { $size: 0 } },
+    }).populate({
+      path: "due_payment_details.rideId",
+      model: "RideDetails",
+    });
+
+    for (const khata of khatas) {
+      let updated = false;
+
+      // Update each due_payment_detail that hasn't been paid yet
+      for (const detail of khata.due_payment_details) {
+        if (detail.rideId) {
+          const ride = detail.rideId;
+
+          // Recalculate profits with new commission rates
+          const totalAmount = ride.total_amount || detail.total_price;
+
+          // Calculate new franchise profit
+          const newFranchiseProfit = Math.ceil(
+            (newFranchiseRate / 100) * totalAmount
+          );
+          const newAdminProfit = Math.ceil((newAdminRate / 100) * totalAmount);
+          const newDriverProfit = Math.ceil(
+            totalAmount - newFranchiseProfit - newAdminProfit
+          );
+
+          // Update the detail record
+          detail.franchise_profit = newFranchiseProfit;
+          detail.admin_profit = newAdminProfit;
+          detail.driver_profit = newDriverProfit;
+          updated = true;
+        }
+      }
+
+      if (updated) {
+        // Recalculate total dues
+        khata.franchisedue = khata.due_payment_details.reduce(
+          (sum, detail) => sum + (detail.franchise_profit || 0),
+          0
+        );
+        khata.admindue = khata.due_payment_details.reduce(
+          (sum, detail) => sum + (detail.admin_profit || 0),
+          0
+        );
+        khata.driverdue = khata.due_payment_details.reduce(
+          (sum, detail) => sum + (detail.driver_profit || 0),
+          0
+        );
+
+        await khata.save();
+
+        // Update driver's due_wallet if needed
+        const driver = await Driver.findById(khata.driverId);
+        if (driver) {
+          driver.due_wallet = khata.admindue + khata.franchisedue;
+          await driver.save();
+        }
+      }
+    }
+
+    console.log(
+      `Updated ${khatas.length} khata records for franchise ${franchiseId}`
+    );
+  } catch (error) {
+    console.error("Error updating khata records:", error.message);
+    throw error;
+  }
+}
+
+//  Get all franchises with their commission settings
 export const getAllFranchisesWithCommissionSettings = asyncHandler(
   async (req, res) => {
     try {
@@ -341,7 +499,7 @@ export const getAllFranchisesWithCommissionSettings = asyncHandler(
   }
 );
 
-// ✅ Get commission settings history for a franchise
+// Get commission settings history for a franchise
 export const getFranchiseCommissionHistory = asyncHandler(async (req, res) => {
   const { franchiseId } = req.params;
   const { setting_type, limit = 50, page = 1 } = req.query;
@@ -455,7 +613,7 @@ export const getFranchiseCommissionHistory = asyncHandler(async (req, res) => {
   }
 });
 
-// ✅ Deactivate commission settings for a franchise
+//  Deactivate commission settings for a franchise
 export const deactivateFranchiseCommissionSettings = asyncHandler(
   async (req, res) => {
     const { franchiseId } = req.params;
@@ -548,7 +706,7 @@ export const deactivateFranchiseCommissionSettings = asyncHandler(
   }
 );
 
-// ✅ Reactivate commission settings for a franchise
+// Reactivate commission settings for a franchise
 export const reactivateFranchiseCommissionSettings = asyncHandler(
   async (req, res) => {
     const { franchiseId } = req.params;

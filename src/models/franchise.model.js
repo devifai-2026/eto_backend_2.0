@@ -1,4 +1,6 @@
 import mongoose, { Schema } from "mongoose";
+import { Admin } from "./admin.model.js";
+import { FranchiseCommissionSettings } from "./commissionSettings.model.js";
 
 const franchiseSchema = new Schema(
   {
@@ -222,5 +224,61 @@ franchiseSchema.index({ "address.district": 1 });
 franchiseSchema.index({ isActive: 1, isApproved: 1 });
 franchiseSchema.index({ createdBy: 1 });
 franchiseSchema.index({ "accessible_pincodes.pincode": 1 });
+
+// Auto-create commission settings when a new franchise is created
+franchiseSchema.post("save", async function (doc, next) {
+  try {
+    const admin = await Admin.findOne();
+
+    if (!admin) {
+      console.warn("Admin not found. Skipping commission settings creation.");
+      return next();
+    }
+
+    // Check if commission settings already exist
+    const existingSettings = await FranchiseCommissionSettings.findOne({
+      franchiseId: doc._id,
+    });
+
+    if (!existingSettings) {
+      const commissionSettings = new FranchiseCommissionSettings({
+        franchiseId: doc._id,
+        admin_commission_rate: 18,
+        franchise_commission_rate: 10,
+        last_changed_by: admin._id,
+      });
+
+      // Add initial history entries
+      commissionSettings.settings_history.push({
+        setting_type: "admin_commission",
+        field_name: "admin_commission_rate",
+        old_value: 0,
+        new_value: 18,
+        changed_by: admin._id,
+        changed_at: new Date(),
+        reason: "Initial commission settings created",
+      });
+
+      commissionSettings.settings_history.push({
+        setting_type: "franchise_commission",
+        field_name: "franchise_commission_rate",
+        old_value: 0,
+        new_value: 10,
+        changed_by: admin._id,
+        changed_at: new Date(),
+        reason: "Initial commission settings created",
+      });
+
+      await commissionSettings.save();
+
+      console.log(`Commission settings created for franchise: ${doc.name}`);
+    }
+
+    next();
+  } catch (error) {
+    console.error("Error creating franchise commission settings:", error);
+    next(error);
+  }
+});
 
 export const Franchise = mongoose.model("Franchise", franchiseSchema);
