@@ -86,7 +86,6 @@ export const setupSocketIO = (server) => {
       }
     });
 
-
     // New event: Update Driver Location
     socket.on("updateDriverLocation", async (data) => {
       const { driverId, lat, lng } = data;
@@ -185,6 +184,11 @@ export const setupSocketIO = (server) => {
         totalPrice,
         distanceToPickup,
         estimatedTimeToPickup,
+        adminCommissionRate,
+        franchiseCommissionRate,
+        adminProfit,
+        franchiseProfit,
+        driverProfit,
       } = rideDetails;
 
       try {
@@ -202,6 +206,11 @@ export const setupSocketIO = (server) => {
               totalPrice,
               distanceToPickup,
               estimatedTimeToPickup,
+              adminCommissionRate,
+              franchiseCommissionRate,
+              adminProfit,
+              franchiseProfit,
+              driverProfit,
             });
 
             sendDriverNotification(

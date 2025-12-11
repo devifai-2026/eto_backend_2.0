@@ -14,10 +14,11 @@ import ApiResponse from "../utils/ApiResponse.js";
 import geolib from "geolib";
 import { Franchise } from "../models/franchise.model.js";
 import { Admin } from "./../models/admin.model.js";
+import { FranchiseCommissionSettings } from "../models/commissionSettings.model.js";
 
 // Create Driver Function
 export const createDriver = asyncHandler(async (req, res) => {
-  const { phone, pin_code } = req.body; 
+  const { phone, pin_code } = req.body;
 
   if (!phone || !pin_code) {
     return res
@@ -1236,7 +1237,7 @@ export const getApprovedStatus = asyncHandler(async (req, res) => {
   }
 });
 
-// Approve Driver Function
+// Approve Driver Function - Updated for commission and fare settings
 export const approveDriverByDriverId = asyncHandler(async (req, res) => {
   const { driverId, franchiseId, adminId } = req.body;
 
@@ -1378,24 +1379,91 @@ export const approveDriverByDriverId = asyncHandler(async (req, res) => {
       }
     }
 
-    // Check if Khata entry already exists
+    // STEP 1: Check if FranchiseCommissionSettings exists
+    let franchiseCommissionSettings = null;
+    let adminCommissionRate = 18; // Default admin commission
+    let franchiseCommissionRate = 0;
+
+    if (driver.franchiseId) {
+      franchiseCommissionSettings = await FranchiseCommissionSettings.findOne({
+        franchiseId: driver.franchiseId._id,
+        isActive: true,
+      });
+
+      if (franchiseCommissionSettings) {
+        adminCommissionRate = franchiseCommissionSettings.admin_commission_rate;
+        franchiseCommissionRate =
+          franchiseCommissionSettings.franchise_commission_rate;
+      } else {
+        // Create default commission settings if not exists
+        franchiseCommissionSettings = new FranchiseCommissionSettings({
+          franchiseId: driver.franchiseId._id,
+          admin_commission_rate: 18,
+          franchise_commission_rate: 10,
+          last_changed_by: approverAdminId,
+        });
+
+        // Add initial history entries
+        franchiseCommissionSettings.settings_history.push({
+          setting_type: "admin_commission",
+          field_name: "admin_commission_rate",
+          old_value: 0,
+          new_value: 18,
+          changed_by: approverAdminId,
+          changed_at: new Date(),
+          reason: "Initial commission settings created",
+        });
+
+        franchiseCommissionSettings.settings_history.push({
+          setting_type: "franchise_commission",
+          field_name: "franchise_commission_rate",
+          old_value: 0,
+          new_value: 10,
+          changed_by: approverAdminId,
+          changed_at: new Date(),
+          reason: "Initial commission settings created",
+        });
+
+        await franchiseCommissionSettings.save();
+        console.log(
+          `Created commission settings for franchise: ${driver.franchiseId.name}`
+        );
+      }
+    }
+
+    // STEP 2: Check if Khata entry already exists
     const existingKhata = await Khata.findOne({ driverId });
     if (!existingKhata && approverAdminId) {
-      // Create Khata entry
+      // Create Khata entry with proper commission rates
       const khataData = {
         driverId,
-        adminId: approverAdminId, // Always admin ID
-        franchiseId: driver.franchiseId ? driver.franchiseId._id : null, // Franchise ID if exists
+        adminId: approverAdminId,
+        franchiseId: driver.franchiseId ? driver.franchiseId._id : null,
         driverdue: 0,
         admindue: 0,
         franchisedue: 0,
       };
 
       console.log("Creating Khata with data:", khataData);
-      await Khata.create(khataData);
+      const newKhata = await Khata.create(khataData);
+
+      // Add initial due payment details for record keeping
+      newKhata.due_payment_details.push({
+        driverId,
+        rideId: null, // No ride yet
+        total_price: 0,
+        admin_profit: 0,
+        franchise_profit: 0,
+        driver_profit: 0,
+        payment_mode: null,
+        createdAt: new Date(),
+        reason: "Initial Khata entry created during driver approval",
+      });
+
+      await newKhata.save();
     }
 
-    // Generate ETO card if not exists
+    // STEP 3: Generate ETO card if not exists
     const existingEtoCard = await ETOCard.findOne({ driverId });
     if (!existingEtoCard) {
       let eto_id_num;
@@ -1432,12 +1500,12 @@ export const approveDriverByDriverId = asyncHandler(async (req, res) => {
       await ETOCard.create(etoCardData);
     }
 
-    // Update driver status
+    // STEP 4: Update driver status
     driver.isApproved = true;
     driver.isActive = true;
     await driver.save();
 
-    // Update franchise total_drivers count if needed
+    // STEP 5: Update franchise total_drivers count if needed
     if (shouldUpdateFranchiseCount && driver.franchiseId) {
       const approvedDriverCount = await Driver.countDocuments({
         franchiseId: driver.franchiseId._id,
@@ -1449,29 +1517,49 @@ export const approveDriverByDriverId = asyncHandler(async (req, res) => {
       });
     }
 
-    return res.status(200).json(
-      new ApiResponse(
-        200,
-        {
-          driver: {
-            _id: driver._id,
-            name: driver.name,
-            phone: driver.phone,
-            isApproved: driver.isApproved,
-            isActive: driver.isActive,
-            franchiseId: driver.franchiseId ? driver.franchiseId._id : null,
+    // STEP 6: Prepare response with commission settings
+    const responseData = {
+      driver: {
+        _id: driver._id,
+        name: driver.name,
+        phone: driver.phone,
+        isApproved: driver.isApproved,
+        isActive: driver.isActive,
+        franchiseId: driver.franchiseId ? driver.franchiseId._id : null,
+        franchiseName: driver.franchiseId ? driver.franchiseId.name : null,
+      },
+      commissionSettings: franchiseCommissionSettings
+        ? {
+            adminCommissionRate:
+              franchiseCommissionSettings.admin_commission_rate,
+            franchiseCommissionRate:
+              franchiseCommissionSettings.franchise_commission_rate,
+          }
+        : {
+            adminCommissionRate: 18, // Default for non-franchise
+            franchiseCommissionRate: 0,
           },
-          franchiseAssigned: !!driver.franchiseId,
-          franchiseName: driver.franchiseId ? driver.franchiseId.name : null,
-          approvedBy: approvedByType,
-          khataData: {
-            adminId: approverAdminId, // Always admin ID
-            franchiseId: driver.franchiseId ? driver.franchiseId._id : null, // Only if driver has franchise
-          },
-        },
-        approvalMessage
-      )
-    );
+      khataInfo: {
+        hasKhata: !!(await Khata.findOne({ driverId })),
+        adminId: approverAdminId,
+        franchiseId: driver.franchiseId ? driver.franchiseId._id : null,
+      },
+      approvedBy: approvedByType,
+    };
+
+    return res
+      .status(200)
+      .json(
+        new ApiResponse(
+          200,
+          responseData,
+          `${approvalMessage}. ${
+            driver.franchiseId
+              ? `Commission rates set: Admin ${franchiseCommissionSettings?.admin_commission_rate || 18}%, Franchise ${franchiseCommissionSettings?.franchise_commission_rate || 10}%`
+              : "Default commission rate: Admin 18%"
+          }`
+        )
+      );
   } catch (error) {
     console.error("Error approving driver:", error.message);
     return res

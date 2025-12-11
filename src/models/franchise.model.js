@@ -183,12 +183,12 @@ const franchiseSchema = new Schema(
       default: 0,
       min: 0,
     },
-    commission_rate: {
-      type: Number,
-      default: 10, // Default commission percentage
-      min: 0,
-      max: 100,
-    },
+    // commission_rate: {
+    //   type: Number,
+    //   default: 10, // Default commission percentage
+    //   min: 0,
+    //   max: 100,
+    // },
 
     // Login and Session
     userId: {
