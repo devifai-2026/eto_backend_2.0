@@ -147,10 +147,12 @@ const franchiseSchema = new Schema(
 
     // Document Information
     documents: {
-      identity_document: {
-        type: String, // URL for identity document image
-        required: [true, "Identity document image is required"],
-      },
+      identity_documents: [
+        {
+          type: String, // Array of URLs for identity documents
+          required: [true, "At least one identity document is required"],
+        },
+      ],
       trade_license: {
         type: String, // URL for trade license image
         required: [true, "Trade license image is required"],

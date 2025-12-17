@@ -36,7 +36,8 @@ usersSchema.methods.generateAccessToken = function () {
     {
       _id: this._id,
       isDriver: this.isDriver,
-      isAdmin: this.isAdmin, // Include isAdmin in the token payload
+      isAdmin: this.isAdmin,
+      isFranchise: this.isFranchise,
     },
     process.env.ACCESS_TOKEN_SECRET,
     {
@@ -50,7 +51,8 @@ usersSchema.methods.generateRefreshToken = function () {
     {
       _id: this._id,
       isDriver: this.isDriver,
-      isAdmin: this.isAdmin, // Include isAdmin in the token payload
+      isAdmin: this.isAdmin,
+      isFranchise: this.isFranchise,
     },
     process.env.REFRESH_TOKEN_SECRET,
     {
