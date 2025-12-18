@@ -46,6 +46,7 @@ import etoRouter from "./routes/eto.routes.js";
 import paymentRouter from "./routes/payment.routes.js";
 import ratingRouter from "./routes/rating.routes.js";
 import franchisesRouter from "./routes/franchise.routes.js";
+import fareSettingsRouter from "./routes/fareSettings.routes.js";
 import path from "path";
 import fs from "fs";
 
@@ -59,6 +60,7 @@ app.use("/eto/api/v1/eto", etoRouter);
 app.use("/", paymentRouter);
 app.use("/eto/api/v1/rating", ratingRouter);
 app.use("/eto/api/v1/franchises", franchisesRouter);
+app.use("/eto/api/v1/fare-settings", fareSettingsRouter);
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use(
   "/franchise-documents",
