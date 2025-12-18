@@ -4,6 +4,9 @@ import { Franchise } from "../models/franchise.model.js";
 import { Admin } from "../models/admin.model.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import { DueRequest } from "../models/dueRequest.model.js";
+import { Driver } from "../models/driver.model.js";
+import { RideDetails } from "../models/rideDetails.model.js";
+import { Khata } from "../models/khata.model.js";
 
 // Get commission settings for a specific franchise
 export const getFranchiseCommissionSettings = asyncHandler(async (req, res) => {
@@ -150,20 +153,18 @@ export const updateFranchiseCommissionSettings = asyncHandler(
 
       if (activeRideDrivers.length > 0) {
         const driverNames = activeRideDrivers.map((d) => d.name).join(", ");
-        return res
-          .status(400)
-          .json(
-            new ApiResponse(
-              400,
-              {
-                activeDrivers: activeRideDrivers.map((d) => ({
-                  id: d._id,
-                  name: d.name,
-                })),
-              },
-              `Cannot update commission settings while drivers are on active rides: ${driverNames}`
-            )
-          );
+        return res.status(400).json(
+          new ApiResponse(
+            400,
+            {
+              activeDrivers: activeRideDrivers.map((d) => ({
+                id: d._id,
+                name: d.name,
+              })),
+            },
+            `Cannot update commission settings while drivers are on active rides: ${driverNames}`
+          )
+        );
       }
 
       // 2. Check for drivers with due requests or due balances
@@ -363,9 +364,7 @@ export const updateFranchiseCommissionSettings = asyncHandler(
 // Helper function to update Khata records when commission rates change
 async function updateKhataForFranchise(
   franchiseId,
-  oldFranchiseRate,
   newFranchiseRate,
-  oldAdminRate,
   newAdminRate
 ) {
   try {
@@ -445,38 +444,202 @@ async function updateKhataForFranchise(
 export const getAllFranchisesWithCommissionSettings = asyncHandler(
   async (req, res) => {
     try {
-      // Get all franchises
-      const franchises = await Franchise.find({ isActive: true }).select(
-        "name email phone address.city address.district total_drivers total_earnings"
-      );
+      const { page = 1, limit = 10, search = "", status = "" } = req.query;
+      const pageNumber = parseInt(page);
+      const pageSize = parseInt(limit);
+      const skip = (pageNumber - 1) * pageSize;
+
+      // Build search query
+      let franchiseQuery = { isActive: true };
+
+      if (search) {
+        franchiseQuery.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+          { phone: { $regex: search, $options: "i" } },
+          { "address.city": { $regex: search, $options: "i" } },
+          { "address.district": { $regex: search, $options: "i" } },
+        ];
+      }
+
+      // Get total count
+      const totalFranchises = await Franchise.countDocuments(franchiseQuery);
+
+      // Get franchises with pagination
+      const franchises = await Franchise.find(franchiseQuery)
+        .select(
+          "name email phone address.city address.district total_drivers total_earnings isActive isApproved createdBy total_completed_rides"
+        )
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(pageSize)
+        .lean();
+
+      // Get franchise IDs
+      const franchiseIds = franchises.map((f) => f._id);
 
       // Get commission settings for all franchises
       const commissionSettings = await FranchiseCommissionSettings.find({
-        franchiseId: { $in: franchises.map((f) => f._id) },
-        isActive: true,
+        franchiseId: { $in: franchiseIds },
       }).populate("last_changed_by", "name email");
 
-      // Create a map for quick lookup
+      // Get additional statistics for each franchise
+      // You might need to query your ride model for more accurate stats
+      // This is a simplified example
+
+      // Get driver counts for each franchise
+      const driverCounts = await Driver.aggregate([
+        { $match: { franchiseId: { $in: franchiseIds }, isActive: true } },
+        { $group: { _id: "$franchiseId", count: { $sum: 1 } } },
+      ]);
+
+      // Get recent earnings/rides for each franchise
+      // This depends on your data model - adjust as needed
+      const rideStats = await RideDetails.aggregate([
+        {
+          $match: {
+            franchiseId: { $in: franchiseIds },
+            ride_status: "completed",
+            createdAt: {
+              $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+            }, // Last 30 days
+          },
+        },
+        {
+          $group: {
+            _id: "$franchiseId",
+            total_rides: { $sum: 1 },
+            total_earnings: { $sum: "$total_amount" },
+          },
+        },
+      ]);
+
+      // Create maps for quick lookup
       const settingsMap = {};
+      const driverCountMap = {};
+      const rideStatsMap = {};
+
       commissionSettings.forEach((setting) => {
         settingsMap[setting.franchiseId.toString()] = setting;
       });
 
-      // Combine franchise data with commission settings
-      const franchisesWithSettings = franchises.map((franchise) => {
-        const settings = settingsMap[franchise._id.toString()] || null;
-        return {
-          franchise: franchise.toObject(),
-          commission_settings: settings,
+      driverCounts.forEach((item) => {
+        driverCountMap[item._id.toString()] = item.count;
+      });
+
+      rideStats.forEach((item) => {
+        rideStatsMap[item._id.toString()] = {
+          recent_rides: item.total_rides,
+          recent_earnings: item.total_earnings,
         };
       });
+
+      // Calculate summary statistics
+      const summary = {
+        total_franchises: totalFranchises,
+        active_franchises: franchises.filter((f) => f.isActive && f.isApproved)
+          .length,
+        approved_franchises: franchises.filter((f) => f.isApproved).length,
+        pending_settings: franchises.filter(
+          (f) => !settingsMap[f._id.toString()]
+        ).length,
+        total_commission_changes: commissionSettings.reduce(
+          (sum, setting) => sum + (setting.settings_history?.length || 0),
+          0
+        ),
+        total_admin_commission: commissionSettings.reduce(
+          (sum, setting) => sum + setting.admin_commission_rate,
+          0
+        ),
+        total_franchise_commission: commissionSettings.reduce(
+          (sum, setting) => sum + setting.franchise_commission_rate,
+          0
+        ),
+        total_drivers: driverCounts.reduce((sum, item) => sum + item.count, 0),
+        total_completed_rides: rideStats.reduce(
+          (sum, item) => sum + item.total_rides,
+          0
+        ),
+        total_franchise_earnings: rideStats.reduce(
+          (sum, item) => sum + item.total_earnings,
+          0
+        ),
+        total_admin_earnings: rideStats.reduce(
+          (sum, item) => sum + item.total_earnings * 0.18,
+          0
+        ), // Assuming 18% admin commission
+      };
+
+      // Combine franchise data with commission settings and additional stats
+      const franchisesWithSettings = franchises.map((franchise) => {
+        const settings = settingsMap[franchise._id.toString()] || null;
+        const driverCount = driverCountMap[franchise._id.toString()] || 0;
+        const recentStats = rideStatsMap[franchise._id.toString()] || {
+          recent_rides: 0,
+          recent_earnings: 0,
+        };
+
+        return {
+          franchise: {
+            ...franchise,
+            driver_count: driverCount,
+            recent_rides: recentStats.recent_rides,
+            recent_earnings: recentStats.recent_earnings,
+            franchise_earnings: franchise.total_earnings || 0,
+          },
+          commission_settings: settings
+            ? {
+                _id: settings._id,
+                admin_commission_rate: settings.admin_commission_rate,
+                franchise_commission_rate: settings.franchise_commission_rate,
+                isActive: settings.isActive,
+                last_changed_by: settings.last_changed_by,
+                settings_history_count: settings.settings_history?.length || 0,
+                createdAt: settings.createdAt,
+                updatedAt: settings.updatedAt,
+              }
+            : null,
+        };
+      });
+
+      // Apply status filter if provided
+      let filteredFranchises = franchisesWithSettings;
+      if (status === "active") {
+        filteredFranchises = franchisesWithSettings.filter(
+          (item) => item.commission_settings?.isActive === true
+        );
+      } else if (status === "inactive") {
+        filteredFranchises = franchisesWithSettings.filter(
+          (item) =>
+            item.commission_settings &&
+            item.commission_settings.isActive === false
+        );
+      } else if (status === "pending") {
+        filteredFranchises = franchisesWithSettings.filter(
+          (item) => !item.commission_settings
+        );
+      }
+
+      const totalPages = Math.ceil(filteredFranchises.length / pageSize);
+      const paginatedFranchises = filteredFranchises.slice(
+        skip,
+        skip + pageSize
+      );
 
       return res.status(200).json(
         new ApiResponse(
           200,
           {
-            franchises: franchisesWithSettings,
-            total: franchises.length,
+            summary,
+            franchises: paginatedFranchises,
+            pagination: {
+              total: filteredFranchises.length,
+              page: pageNumber,
+              pages: totalPages,
+              limit: pageSize,
+              hasNextPage: pageNumber < totalPages,
+              hasPrevPage: pageNumber > 1,
+            },
           },
           "All franchises with commission settings fetched successfully"
         )
