@@ -40,7 +40,7 @@ const khataSchema = new Schema(
           type: Schema.Types.ObjectId,
           ref: "Ride",
           default: null,
-          required: [true, "Ride ID is required"],
+          // required: [true, "Ride ID is required"],
         },
         total_price: {
           type: Number,

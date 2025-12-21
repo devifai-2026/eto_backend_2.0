@@ -76,6 +76,7 @@ export const loginAndSendOtp = asyncHandler(async (req, res) => {
       "9733524164",
       "7872358979",
       "9830880062",
+      "1234567890",
     ];
 
     // --- FRANCHISE LOGIC ---
@@ -570,6 +571,12 @@ export const verifyOtp = asyncHandler(async (req, res) => {
         role: "franchise",
       },
       9733524164: {
+        // Driver bypass
+        verificationId: "1234567",
+        code: "1234",
+        role: "driver",
+      },
+      1234567890: {
         // Driver bypass
         verificationId: "1234567",
         code: "1234",
