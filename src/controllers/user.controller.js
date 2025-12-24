@@ -77,6 +77,7 @@ export const loginAndSendOtp = asyncHandler(async (req, res) => {
       "7872358979",
       "9830880062",
       "1234567890",
+      "7872358975",
     ];
 
     // --- FRANCHISE LOGIC ---
@@ -565,6 +566,12 @@ export const verifyOtp = asyncHandler(async (req, res) => {
     // OTP bypass configuration
     const bypassConfig = {
       8145328152: {
+        // Franchise bypass
+        verificationId: "1234567",
+        code: "1234",
+        role: "franchise",
+      },
+      7872358975: {
         // Franchise bypass
         verificationId: "1234567",
         code: "1234",

@@ -146,34 +146,281 @@ export const createDriver = asyncHandler(async (req, res) => {
 // Get All Drivers Function
 export const getAllDrivers = asyncHandler(async (req, res) => {
   try {
-    const drivers = await Driver.find();
+    // Extract and validate query parameters
+    const { 
+      adminId, 
+      franchiseId, 
+      search, 
+      isActive, 
+      isOnRide,
+      page = '1', 
+      limit = '20',
+      sortBy = 'createdAt',
+      sortOrder = 'desc'
+    } = req.query;
 
-    // Get ETO card details for each driver
-    const driversWithETOCards = await Promise.all(
-      drivers.map(async (driver) => {
-        const etoCard = await ETOCard.findOne({ driverId: driver._id });
-        return {
-          ...driver.toObject(),
-          etoCard: etoCard || null,
-        };
-      })
-    );
+    // Validate and parse pagination parameters
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit) || 20));
+
+    // Validate sort parameters
+    const validSortFields = ['createdAt', 'name', 'total_earning', 'total_complete_rides'];
+    const isValidSortField = validSortFields.includes(sortBy);
+    const finalSortBy = isValidSortField ? sortBy : 'createdAt';
+    
+    const isValidSortOrder = ['asc', 'desc'].includes(sortOrder.toLowerCase());
+    const finalSortOrder = isValidSortOrder ? sortOrder.toLowerCase() : 'desc';
+
+    // Build query object
+    const baseQuery = {};
+
+    // Admin/Franchise access control
+    let appliedFranchiseId = null;
+    
+    if (franchiseId) {
+      if (!mongoose.Types.ObjectId.isValid(franchiseId)) {
+        return res.status(400).json(
+          new ApiResponse(400, null, "Invalid franchise ID format")
+        );
+      }
+      
+      // Only apply franchise filter if adminId is NOT provided
+      if (!adminId) {
+        baseQuery.franchiseId = franchiseId;
+        appliedFranchiseId = franchiseId;
+      }
+    }
+
+    // Search functionality
+    if (search && search.trim() !== '') {
+      const searchTerm = search.trim();
+      const searchRegex = new RegExp(searchTerm, 'i');
+      
+      baseQuery.$or = [
+        { name: { $regex: searchRegex } },
+        { phone: { $regex: searchRegex } },
+        { email: { $regex: searchRegex } },
+        { license_number: { $regex: searchRegex } }
+      ];
+    }
+
+    // Boolean filters
+    if (isActive !== undefined) {
+      if (isActive === 'true' || isActive === 'false') {
+        baseQuery.isActive = isActive === 'true';
+      } else {
+        return res.status(400).json(
+          new ApiResponse(400, null, "isActive must be 'true' or 'false'")
+        );
+      }
+    }
+
+    if (isOnRide !== undefined) {
+      if (isOnRide === 'true' || isOnRide === 'false') {
+        baseQuery.is_on_ride = isOnRide === 'true';
+      } else {
+        return res.status(400).json(
+          new ApiResponse(400, null, "isOnRide must be 'true' or 'false'")
+        );
+      }
+    }
+
+    // Calculate skip for pagination
+    const skip = (pageNum - 1) * limitNum;
+
+    // Configure sorting
+    const sortOptions = {};
+    sortOptions[finalSortBy] = finalSortOrder === 'desc' ? -1 : 1;
+
+    // ====================
+    // GET SUMMARY STATISTICS
+    // ====================
+    let summaryStats = {
+      totalDrivers: 0,
+      totalActiveDrivers: 0,
+      totalEarnings: 0,
+      totalRides: 0
+    };
+
+    // Get total drivers count
+    summaryStats.totalDrivers = await Driver.countDocuments(baseQuery);
+
+    // Get active drivers count
+    const activeQuery = { ...baseQuery, isActive: true };
+    summaryStats.totalActiveDrivers = await Driver.countDocuments(activeQuery);
+
+    // Get driver IDs for earnings and rides calculation
+    const driversForStats = await Driver.find(baseQuery).select('_id').lean();
+    const driverIds = driversForStats.map(driver => driver._id);
+
+    if (driverIds.length > 0) {
+      // Get total earnings and rides from RideDetails
+      const statsAggregation = await RideDetails.aggregate([
+        {
+          $match: {
+            driverId: { $in: driverIds },
+            isRide_ended: true
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            totalEarnings: { $sum: "$driver_profit" },
+            totalRides: { $sum: 1 }
+          }
+        }
+      ]);
+
+      if (statsAggregation.length > 0) {
+        summaryStats.totalEarnings = Math.ceil(statsAggregation[0].totalEarnings);
+        summaryStats.totalRides = statsAggregation[0].totalRides;
+      }
+    }
+
+    // ====================
+    // GET PAGINATED DRIVERS
+    // ====================
+    // Get total count for pagination
+    const totalDrivers = summaryStats.totalDrivers;
+    const totalPages = Math.ceil(totalDrivers / limitNum);
+
+    // If no drivers found, return early with summary
+    if (totalDrivers === 0) {
+      return res.status(200).json(
+        new ApiResponse(
+          200,
+          {
+            summary: summaryStats,
+            drivers: [],
+            pagination: {
+              total: totalDrivers,
+              page: pageNum,
+              limit: limitNum,
+              totalPages,
+              hasNext: false,
+              hasPrev: false
+            },
+            filters: {
+              search: search || null,
+              isActive: isActive || null,
+              isOnRide: isOnRide || null,
+              franchiseId: appliedFranchiseId,
+              adminId: adminId || null,
+              sortBy: finalSortBy,
+              sortOrder: finalSortOrder
+            }
+          },
+          "No drivers found matching the criteria"
+        )
+      );
+    }
+
+    // Execute query with pagination - select only needed fields
+    const drivers = await Driver.find(baseQuery)
+      .select('_id name phone email createdAt isActive is_on_ride total_earning total_complete_rides')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(limitNum)
+      .lean();
+
+    // Get ETO card numbers for these drivers
+    const etoCards = await ETOCard.find({ 
+      driverId: { $in: drivers.map(d => d._id) } 
+    })
+    .select('driverId eto_id_num')
+    .lean();
+
+    // Create ETO card map
+    const etoCardMap = {};
+    etoCards.forEach(card => {
+      etoCardMap[card.driverId.toString()] = card.eto_id_num;
+    });
+
+    // Format drivers for response
+    const formattedDrivers = drivers.map(driver => {
+      return {
+        id: driver._id,
+        name: driver.name,
+        joinedDate: driver.createdAt.toISOString().split('T')[0], // YYYY-MM-DD format
+        contact: {
+          phone: driver.phone,
+          email: driver.email
+        },
+        etoIdNumber: etoCardMap[driver._id.toString()] || 'N/A',
+        status: driver.isActive ? 'Active' : 'Inactive',
+        totalEarnings: Math.ceil(driver.total_earning || 0),
+        totalRides: driver.total_complete_rides || 0,
+        isOnRide: driver.is_on_ride || false,
+        // Additional quick status
+        availability: driver.isActive 
+          ? (driver.is_on_ride ? 'On Ride' : 'Available') 
+          : 'Offline'
+      };
+    });
+
+    // ====================
+    // FORMAT RESPONSE
+    // ====================
+    // Generate response message
+    let message = "Drivers retrieved successfully";
+    
+    if (appliedFranchiseId) {
+      const franchise = await Franchise.findById(appliedFranchiseId).select('name').lean();
+      message = `Franchise "${franchise?.name || appliedFranchiseId}" drivers retrieved`;
+    } else if (adminId) {
+      message = "All drivers retrieved (Admin view)";
+    }
+    
+    if (search) {
+      message += `, searched for: "${search}"`;
+    }
+
+    // Prepare response
+    const responseData = {
+      summary: {
+        ...summaryStats,
+        totalInactiveDrivers: summaryStats.totalDrivers - summaryStats.totalActiveDrivers,
+        avgEarningsPerDriver: summaryStats.totalDrivers > 0 
+          ? Math.ceil(summaryStats.totalEarnings / summaryStats.totalDrivers) 
+          : 0,
+        avgRidesPerDriver: summaryStats.totalDrivers > 0 
+          ? Math.ceil(summaryStats.totalRides / summaryStats.totalDrivers) 
+          : 0
+      },
+      drivers: formattedDrivers,
+      pagination: {
+        total: totalDrivers,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        hasNext: pageNum < totalPages,
+        hasPrev: pageNum > 1
+      },
+      filters: {
+        search: search || null,
+        isActive: isActive || null,
+        isOnRide: isOnRide || null,
+        franchiseId: appliedFranchiseId,
+        adminId: adminId || null,
+        sortBy: finalSortBy,
+        sortOrder: finalSortOrder
+      }
+    };
 
     return res.status(200).json(
-      new ApiResponse(
-        200,
-        {
-          drivers: driversWithETOCards,
-          count: drivers.length,
-        },
-        "Drivers retrieved successfully with ETO card details"
-      )
+      new ApiResponse(200, responseData, message)
     );
+
   } catch (error) {
-    console.error("Error retrieving drivers:", error.message);
-    return res
-      .status(500)
-      .json(new ApiResponse(500, null, "Failed to retrieve drivers"));
+    console.error("Error in getAllDrivers:", {
+      message: error.message,
+      stack: error.stack,
+      query: req.query
+    });
+    
+    return res.status(500).json(
+      new ApiResponse(500, null, "An error occurred while retrieving drivers")
+    );
   }
 });
 
