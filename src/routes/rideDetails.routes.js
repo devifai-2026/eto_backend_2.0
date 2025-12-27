@@ -5,13 +5,13 @@ import {
   cancelRide,
   findAvailableDrivers,
   getAllActiveRides,
+  getRideById,
   getRideHistory,
   getTotalDriversInCurrentRides,
   getTotalEarningsOfEndedRides,
   getTotalRides,
   rejectRide,
   updatePaymentMode,
-  // findAvailableDrivers2,
   verifyDropOtp,
   verifyPickUpOtp,
 } from "../controllers/rideDetailsController.js"; // Ensure the correct file path
@@ -25,6 +25,7 @@ const createRouterWithSocket = (io) => {
   router.route("/all-driver/currentride").get(getTotalDriversInCurrentRides);
   router.route("/getTotalRides").get(getTotalRides);
   router.route("/rideHistory").get(getRideHistory);
+  router.route("/:rideId").get(getRideById);
 
   router
     .route("/acceptRide")

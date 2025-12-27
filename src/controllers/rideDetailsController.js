@@ -12,6 +12,7 @@ import ApiResponse from "../utils/ApiResponse.js";
 import { ETOCard } from "../models/eto.model.js";
 import { FareSettings } from "../models/fareSettings.model.js";
 import { FranchiseCommissionSettings } from "../models/commissionSettings.model.js";
+import { Franchise } from "../models/franchise.model.js";
 
 dotenv.config({
   path: "./env",
@@ -20,6 +21,7 @@ dotenv.config({
 // Looking Drivers for Ride new functionality
 export const findAvailableDrivers = asyncHandler(async (req, res) => {
   const { riderId, dropLocation, pickUpLocation, ride_start_time } = req.body;
+  console.log(req.body);
   const proximityRadius = 5; // Search radius in kilometers
 
   if (!riderId || !pickUpLocation || !dropLocation) {
@@ -214,6 +216,7 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
           location: driver.current_location.coordinates,
           name: driver.name,
           phone: driver.phone,
+          driver_photo: driver.driver_photo,
           hasFranchise: hasFranchise,
           franchiseId: franchiseId,
           franchiseName: franchiseName,
@@ -264,6 +267,8 @@ export const findAvailableDrivers = asyncHandler(async (req, res) => {
       isAvailable: true,
     };
 
+    console.log(finalResData);
+
     return res
       .status(200)
       .json(new ApiResponse(200, finalResData, "Drivers found successfully"));
@@ -291,6 +296,8 @@ export const acceptRide = (io) =>
       franchiseProfit,
       driverProfit,
     } = req.body;
+
+    console.log("Accept Ride Request Body:", req.body);
 
     // Input validation
     if (
@@ -1038,69 +1045,259 @@ export const updatePaymentMode = (io) =>
 // API to get all active rides
 export const getAllActiveRides = asyncHandler(async (req, res) => {
   try {
-    // Fetch all rides where isOn is true and populate driver and rider details
-    const activeRides = await RideDetails.find({ isOn: true })
-      .populate({
-        path: "driverId",
-        select: "name phone photo current_location", // Include current_location
-      })
-      .populate({
-        path: "riderId",
-        select: "name phone photo current_location",
+    // Extract query parameters
+    const {
+      adminId,
+      franchiseId,
+      search,
+      page = "1",
+      limit = "20",
+      sortBy = "createdAt",
+      sortOrder = "desc",
+    } = req.query;
+
+    // Validate and parse pagination parameters
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit) || 20));
+    const skip = (pageNum - 1) * limitNum;
+
+    // Validate sort parameters
+    const validSortFields = [
+      "createdAt",
+      "updatedAt",
+      "started_time",
+      "total_km",
+      "total_amount",
+    ];
+    const isValidSortField = validSortFields.includes(sortBy);
+    const finalSortBy = isValidSortField ? sortBy : "createdAt";
+
+    const isValidSortOrder = ["asc", "desc"].includes(sortOrder.toLowerCase());
+    const finalSortOrder = isValidSortOrder ? sortOrder.toLowerCase() : "desc";
+
+    // Build base query
+    const baseQuery = { isOn: true };
+
+    // Admin/Franchise access control
+    let appliedFranchiseId = null;
+
+    if (franchiseId) {
+      if (!mongoose.Types.ObjectId.isValid(franchiseId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+      }
+
+      // Only apply franchise filter if adminId is NOT provided
+      if (!adminId) {
+        appliedFranchiseId = franchiseId;
+      }
+    }
+
+    // Create aggregation pipeline
+    const aggregationPipeline = [];
+
+    // Match stage
+    const matchStage = { $match: baseQuery };
+
+    // Add franchise filter if needed
+    if (appliedFranchiseId) {
+      matchStage.$match.franchiseId = new mongoose.Types.ObjectId(
+        appliedFranchiseId
+      );
+    }
+
+    aggregationPipeline.push(matchStage);
+
+    // Lookup driver and rider details
+    aggregationPipeline.push(
+      {
+        $lookup: {
+          from: "drivers",
+          localField: "driverId",
+          foreignField: "_id",
+          as: "driver",
+        },
+      },
+      {
+        $unwind: {
+          path: "$driver",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $lookup: {
+          from: "riders",
+          localField: "riderId",
+          foreignField: "_id",
+          as: "rider",
+        },
+      },
+      {
+        $unwind: {
+          path: "$rider",
+          preserveNullAndEmptyArrays: true,
+        },
+      }
+    );
+
+    // Filter by search term if provided
+    if (search && search.trim() !== "") {
+      const searchTerm = search.trim();
+      const searchRegex = new RegExp(searchTerm, "i");
+
+      aggregationPipeline.push({
+        $match: {
+          $or: [
+            { "driver.name": { $regex: searchRegex } },
+            { "driver.phone": { $regex: searchRegex } },
+            { "rider.name": { $regex: searchRegex } },
+            { "rider.phone": { $regex: searchRegex } },
+          ],
+        },
+      });
+    }
+
+    // Add franchise info lookup if not filtered by franchise
+    if (!appliedFranchiseId) {
+      aggregationPipeline.push({
+        $lookup: {
+          from: "franchises",
+          localField: "franchiseId",
+          foreignField: "_id",
+          as: "franchiseInfo",
+        },
+      });
+    }
+
+    // Get total count for pagination
+    const countPipeline = [...aggregationPipeline];
+    countPipeline.push({ $count: "total" });
+
+    const [countResult] = await RideDetails.aggregate(countPipeline);
+    const totalRides = countResult ? countResult.total : 0;
+    const totalPages = Math.ceil(totalRides / limitNum);
+
+    // Add sorting
+    const sortStage = {};
+    sortStage[finalSortBy] = finalSortOrder === "desc" ? -1 : 1;
+    aggregationPipeline.push({ $sort: sortStage });
+
+    // Add pagination
+    aggregationPipeline.push({ $skip: skip }, { $limit: limitNum });
+
+    // Project only necessary fields
+    aggregationPipeline.push({
+      $project: {
+        rideId: "$_id",
+        _id: 0,
+        driver: {
+          _id: "$driver._id",
+          name: "$driver.name",
+          phone: "$driver.phone",
+          photo: "$driver.driver_photo",
+          current_location: "$driver.current_location",
+        },
+        rider: {
+          _id: "$rider._id",
+          name: "$rider.name",
+          phone: "$rider.phone",
+          photo: "$rider.photo",
+          current_location: "$rider.current_location",
+        },
+        pickup_location: 1,
+        drop_location: 1,
+        isOn: 1,
+        isRide_started: 1,
+        isRide_ended: 1,
+        started_time: 1,
+        ride_end_time: 1,
+        total_km: 1,
+        total_amount: 1,
+        driver_profit: 1,
+        admin_profit: 1,
+        franchise_profit: 1,
+        payment_mode: 1,
+        isPickUp_verify: 1,
+        isDrop_verify: 1,
+        isPayment_done: 1,
+        createdAt: 1,
+        franchiseId: 1,
+        franchiseInfo: { $arrayElemAt: ["$franchiseInfo", 0] },
+      },
+    });
+
+    // Execute aggregation
+    const activeRides = await RideDetails.aggregate(aggregationPipeline);
+
+    // Prepare summary statistics
+    let summary = {
+      totalActiveRides: totalRides,
+      totalDistance: 0,
+      totalEarnings: 0,
+    };
+
+    if (activeRides.length > 0) {
+      // Calculate total distance and earnings from all active rides
+      const statsPipeline = [...aggregationPipeline.slice(0, -4)]; // Remove pagination and projection
+      statsPipeline.push({
+        $group: {
+          _id: null,
+          totalDistance: { $sum: "$total_km" },
+          totalEarnings: { $sum: "$total_amount" },
+        },
       });
 
-    // Format the response to include driver location
-    const ridesWithLocations = activeRides.map((ride) => ({
-      rideId: ride._id,
-      driver: ride.driverId
-        ? {
-            id: ride.driverId._id,
-            name: ride.driverId.name,
-            phone: ride.driverId.phone,
-            photo: ride.driverId.photo,
-            current_location: ride.driverId.current_location,
-          }
-        : null,
-      rider: ride.riderId
-        ? {
-            id: ride.riderId._id,
-            name: ride.riderId.name,
-            phone: ride.riderId.phone,
-            photo: ride.riderId.photo,
-            current_location: ride.riderId.current_location,
-          }
-        : null,
-      pickup_location: ride.pickup_location,
-      drop_location: ride.drop_location,
-      isOn: ride.isOn,
-      isRide_started: ride.isRide_started,
-      isRide_ended: ride.isRide_ended,
-      started_time: ride.started_time,
-      ride_end_time: ride.ride_end_time,
-      total_km: ride.total_km,
-      total_amount: ride.total_amount,
-      driver_profit: ride.driver_profit,
-      admin_profit: ride.admin_profit,
-      payment_mode: ride.payment_mode,
-      isPickUp_verify: ride.isPickUp_verify,
-      isDrop_verify: ride.isDrop_verify,
-      ispayment_done: ride.isPayment_done,
-      // Add more ride fields as needed
-    }));
+      const [statsResult] = await RideDetails.aggregate(statsPipeline);
+      if (statsResult) {
+        summary.totalDistance = statsResult.totalDistance;
+        summary.totalEarnings = statsResult.totalEarnings;
+      }
+    }
 
-    return res.status(200).json({
-      message:
-        ridesWithLocations.length > 0
-          ? "Active rides retrieved successfully."
-          : "No active rides found.",
-      data: ridesWithLocations,
-    });
+    // Generate response message
+    let message = "Active rides retrieved successfully";
+
+    if (appliedFranchiseId) {
+      const franchise = await Franchise.findById(appliedFranchiseId)
+        .select("name")
+        .lean();
+      message = `Franchise "${franchise?.name || appliedFranchiseId}" active rides retrieved`;
+    } else if (adminId) {
+      message = "All active rides retrieved (Admin view)";
+    }
+
+    if (search) {
+      message += `, searched for: "${search}"`;
+    }
+
+    // Prepare response data
+    const responseData = {
+      summary,
+      rides: activeRides,
+      pagination: {
+        total: totalRides,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        hasNext: pageNum < totalPages,
+        hasPrev: pageNum > 1,
+      },
+      filters: {
+        search: search || null,
+        franchiseId: appliedFranchiseId,
+        adminId: adminId || null,
+        sortBy: finalSortBy,
+        sortOrder: finalSortOrder,
+      },
+    };
+
+    return res.status(200).json(new ApiResponse(200, responseData, message));
   } catch (error) {
     console.error("Error fetching active rides:", error.message);
-    return res.status(500).json({
-      message: "Failed to retrieve active rides.",
-      data: [],
-    });
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to retrieve active rides"));
   }
 });
 
@@ -1236,45 +1433,479 @@ export const getTotalRides = asyncHandler(async (req, res) => {
   }
 });
 
+// API to get ride history with advanced filtering
 export const getRideHistory = asyncHandler(async (req, res) => {
   try {
-    const rides = await RideDetails.find({
-      isPayment_done: true,
-      isRide_ended: true,
-    })
-      .populate({
-        path: "driverId",
-        select: "name phone driver_photo license_number",
-      })
-      .populate({
-        path: "riderId",
-        select: "name phone photo",
-      })
-      .lean();
+    // Extract query parameters
+    const {
+      adminId,
+      franchiseId,
+      driverId,
+      riderId,
+      search,
+      startDate,
+      endDate,
+      paymentMode,
+      rideStatus,
+      minAmount,
+      maxAmount,
+      minDistance,
+      maxDistance,
+      page = "1",
+      limit = "20",
+      sortBy = "ride_end_time",
+      sortOrder = "desc",
+    } = req.query;
 
-    // Map over rides to attach eto_id_num (from ETOCard)
-    const ridesWithETO = await Promise.all(
-      rides.map(async (ride) => {
-        const etoCard = await ETOCard.findOne({ driverId: ride.driverId?._id });
+    // Validate and parse pagination parameters
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit) || 20));
+    const skip = (pageNum - 1) * limitNum;
+
+    // Validate sort parameters
+    const validSortFields = [
+      "createdAt",
+      "updatedAt",
+      "ride_end_time",
+      "started_time",
+      "total_km",
+      "total_amount",
+      "admin_profit",
+      "driver_profit",
+      "franchise_profit",
+    ];
+    const isValidSortField = validSortFields.includes(sortBy);
+    const finalSortBy = isValidSortField ? sortBy : "ride_end_time";
+
+    const isValidSortOrder = ["asc", "desc"].includes(sortOrder.toLowerCase());
+    const finalSortOrder = isValidSortOrder ? sortOrder.toLowerCase() : "desc";
+
+    // Build base query for completed rides
+    const baseQuery = {
+      isRide_ended: true,
+      isPayment_done: true,
+    };
+
+    // Admin/Franchise access control
+    let appliedFranchiseId = null;
+
+    if (franchiseId) {
+      if (!mongoose.Types.ObjectId.isValid(franchiseId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+      }
+
+      // Only apply franchise filter if adminId is NOT provided
+      if (!adminId) {
+        appliedFranchiseId = franchiseId;
+        baseQuery.franchiseId = new mongoose.Types.ObjectId(franchiseId);
+      }
+    }
+
+    // Filter by driver
+    if (driverId && mongoose.Types.ObjectId.isValid(driverId)) {
+      baseQuery.driverId = new mongoose.Types.ObjectId(driverId);
+    }
+
+    // Filter by rider
+    if (riderId && mongoose.Types.ObjectId.isValid(riderId)) {
+      baseQuery.riderId = new mongoose.Types.ObjectId(riderId);
+    }
+
+    // Filter by payment mode
+    if (paymentMode && ["cash", "online"].includes(paymentMode.toLowerCase())) {
+      baseQuery.payment_mode = paymentMode.toLowerCase();
+    }
+
+    // Filter by ride status
+    if (rideStatus) {
+      const statusMap = {
+        completed: { isRide_ended: true, isPayment_done: true },
+        unpaid: { isRide_ended: true, isPayment_done: false },
+        canceled: { isCancel_time: true },
+      };
+      if (statusMap[rideStatus.toLowerCase()]) {
+        Object.assign(baseQuery, statusMap[rideStatus.toLowerCase()]);
+      }
+    }
+
+    // Date range filter
+    if (startDate || endDate) {
+      baseQuery.ride_end_time = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        baseQuery.ride_end_time.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        baseQuery.ride_end_time.$lte = end;
+      }
+    }
+
+    // Amount range filter
+    if (minAmount || maxAmount) {
+      baseQuery.total_amount = {};
+      if (minAmount) {
+        baseQuery.total_amount.$gte = parseFloat(minAmount);
+      }
+      if (maxAmount) {
+        baseQuery.total_amount.$lte = parseFloat(maxAmount);
+      }
+    }
+
+    // Distance range filter
+    if (minDistance || maxDistance) {
+      baseQuery.total_km = {};
+      if (minDistance) {
+        baseQuery.total_km.$gte = parseFloat(minDistance);
+      }
+      if (maxDistance) {
+        baseQuery.total_km.$lte = parseFloat(maxDistance);
+      }
+    }
+
+    // Create aggregation pipeline
+    const aggregationPipeline = [];
+
+    // Match stage
+    aggregationPipeline.push({ $match: baseQuery });
+
+    // Lookup driver and rider details
+    aggregationPipeline.push(
+      {
+        $lookup: {
+          from: "drivers",
+          localField: "driverId",
+          foreignField: "_id",
+          as: "driver",
+        },
+      },
+      {
+        $unwind: {
+          path: "$driver",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $lookup: {
+          from: "riders",
+          localField: "riderId",
+          foreignField: "_id",
+          as: "rider",
+        },
+      },
+      {
+        $unwind: {
+          path: "$rider",
+          preserveNullAndEmptyArrays: true,
+        },
+      }
+    );
+
+    // Add franchise info lookup if not filtered by franchise
+    if (!appliedFranchiseId) {
+      aggregationPipeline.push({
+        $lookup: {
+          from: "franchises",
+          localField: "franchiseId",
+          foreignField: "_id",
+          as: "franchiseInfo",
+        },
+      });
+    }
+
+    // Filter by search term if provided
+    if (search && search.trim() !== "") {
+      const searchTerm = search.trim();
+      const searchRegex = new RegExp(searchTerm, "i");
+
+      aggregationPipeline.push({
+        $match: {
+          $or: [
+            { "driver.name": { $regex: searchRegex } },
+            { "driver.phone": { $regex: searchRegex } },
+            { "rider.name": { $regex: searchRegex } },
+            { "rider.phone": { $regex: searchRegex } },
+            { payment_mode: { $regex: searchRegex } },
+          ],
+        },
+      });
+    }
+
+    // Get total count for pagination
+    const countPipeline = [...aggregationPipeline];
+    countPipeline.push({ $count: "total" });
+
+    const [countResult] = await RideDetails.aggregate(countPipeline);
+    const totalRides = countResult ? countResult.total : 0;
+    const totalPages = Math.ceil(totalRides / limitNum);
+
+    // Add sorting
+    const sortStage = {};
+    sortStage[finalSortBy] = finalSortOrder === "desc" ? -1 : 1;
+    aggregationPipeline.push({ $sort: sortStage });
+
+    // Add pagination
+    aggregationPipeline.push({ $skip: skip }, { $limit: limitNum });
+
+    // Project only necessary fields
+    aggregationPipeline.push({
+      $project: {
+        rideId: "$_id",
+        _id: 0,
+        driver: {
+          _id: "$driver._id",
+          name: "$driver.name",
+          phone: "$driver.phone",
+          driver_photo: "$driver.driver_photo",
+          license_number: "$driver.license_number",
+          current_location: "$driver.current_location",
+        },
+        rider: {
+          _id: "$rider._id",
+          name: "$rider.name",
+          phone: "$rider.phone",
+          photo: "$rider.photo",
+          current_location: "$rider.current_location",
+        },
+        pickup_location: 1,
+        drop_location: 1,
+        total_km: 1,
+        total_amount: 1,
+        admin_percentage: 1,
+        admin_profit: 1,
+        driver_profit: 1,
+        franchise_profit: 1,
+        franchise_commission_rate: 1,
+        payment_mode: 1,
+        isPayment_done: 1,
+        isRide_started: 1,
+        isRide_ended: 1,
+        isOn: 1,
+        isPickUp_verify: 1,
+        isDrop_verify: 1,
+        isCancel_time: 1,
+        pickup_otp: 1,
+        drop_otp: 1,
+        started_time: 1,
+        ride_end_time: 1,
+        drop_time: 1,
+        total_duration: 1,
+        createdAt: 1,
+        updatedAt: 1,
+        franchiseId: 1,
+        adminId: 1,
+        franchiseInfo: { $arrayElemAt: ["$franchiseInfo", 0] },
+      },
+    });
+
+    // Execute aggregation
+    const rideHistory = await RideDetails.aggregate(aggregationPipeline);
+
+    // Get ETO IDs for drivers
+    const rideHistoryWithETO = await Promise.all(
+      rideHistory.map(async (ride) => {
+        const etoCard = await ETOCard.findOne({ driverId: ride.driver?._id });
         return {
           ...ride,
-          driverId: {
-            ...ride.driverId,
+          driver: {
+            ...ride.driver,
             eto_id_num: etoCard?.eto_id_num || null,
           },
         };
       })
     );
 
-    return res.status(200).json({
-      message: "Ride history fetched successfully",
-      total: ridesWithETO.length,
-      data: ridesWithETO,
+    // Prepare summary statistics
+    let summary = {
+      totalRides: totalRides,
+      totalAmount: 0,
+      totalAdminProfit: 0,
+      totalDriverProfit: 0,
+      totalFranchiseProfit: 0,
+      avgAmount: 0,
+      avgDistance: 0,
+    };
+
+    if (rideHistory.length > 0) {
+      // Calculate total statistics
+      const statsPipeline = [...aggregationPipeline.slice(0, -4)]; // Remove pagination and projection
+      statsPipeline.push({
+        $group: {
+          _id: null,
+          totalAmount: { $sum: "$total_amount" },
+          totalAdminProfit: { $sum: "$admin_profit" },
+          totalDriverProfit: { $sum: "$driver_profit" },
+          totalFranchiseProfit: { $sum: "$franchise_profit" },
+          avgAmount: { $avg: "$total_amount" },
+          avgDistance: { $avg: "$total_km" },
+          totalDistance: { $sum: "$total_km" },
+        },
+      });
+
+      const [statsResult] = await RideDetails.aggregate(statsPipeline);
+      if (statsResult) {
+        summary.totalAmount = statsResult.totalAmount || 0;
+        summary.totalAdminProfit = statsResult.totalAdminProfit || 0;
+        summary.totalDriverProfit = statsResult.totalDriverProfit || 0;
+        summary.totalFranchiseProfit = statsResult.totalFranchiseProfit || 0;
+        summary.avgAmount = statsResult.avgAmount || 0;
+        summary.avgDistance = statsResult.avgDistance || 0;
+        summary.totalDistance = statsResult.totalDistance || 0;
+      }
+    }
+
+    // Count by payment mode
+    const paymentStatsPipeline = [...aggregationPipeline.slice(0, -4)];
+    paymentStatsPipeline.push({
+      $group: {
+        _id: "$payment_mode",
+        count: { $sum: 1 },
+        totalAmount: { $sum: "$total_amount" },
+      },
     });
+
+    const paymentStats = await RideDetails.aggregate(paymentStatsPipeline);
+    summary.paymentStats = paymentStats.reduce((acc, stat) => {
+      acc[stat._id || "unknown"] = {
+        count: stat.count,
+        totalAmount: stat.totalAmount,
+      };
+      return acc;
+    }, {});
+
+    // Generate response message
+    let message = "Ride history retrieved successfully";
+
+    if (appliedFranchiseId) {
+      const franchise = await Franchise.findById(appliedFranchiseId)
+        .select("name")
+        .lean();
+      message = `Franchise "${franchise?.name || appliedFranchiseId}" ride history retrieved`;
+    } else if (adminId) {
+      message = "All ride history retrieved (Admin view)";
+    }
+
+    if (search) {
+      message += `, searched for: "${search}"`;
+    }
+    if (startDate || endDate) {
+      message += `, filtered by date range`;
+    }
+
+    // Prepare response data
+    const responseData = {
+      summary,
+      rides: rideHistoryWithETO,
+      pagination: {
+        total: totalRides,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+        hasNext: pageNum < totalPages,
+        hasPrev: pageNum > 1,
+      },
+      filters: {
+        search: search || null,
+        franchiseId: appliedFranchiseId,
+        adminId: adminId || null,
+        driverId: driverId || null,
+        riderId: riderId || null,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        paymentMode: paymentMode || null,
+        rideStatus: rideStatus || null,
+        sortBy: finalSortBy,
+        sortOrder: finalSortOrder,
+      },
+    };
+
+    return res
+      .status(200)
+      .json(new ApiResponse(200, responseData, message));
   } catch (error) {
     console.error("Error fetching ride history:", error.message);
-    return res.status(500).json({
-      message: "Failed to fetch ride history",
-    });
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to retrieve ride history"));
   }
 });
+
+// API to get single ride by ID from history
+export const getRideById = asyncHandler(async (req, res) => {
+  try {
+    const { rideId } = req.params;
+
+    if (!rideId) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Ride ID is required"));
+    }
+
+    // Validate if rideId is a valid ObjectId
+    if (!mongoose.Types.ObjectId.isValid(rideId)) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid Ride ID format"));
+    }
+
+    // Find ride by ID with populated data
+    const ride = await RideDetails.findById(rideId)
+      .populate({
+        path: "driverId",
+        select: "name phone driver_photo current_location license_number email",
+      })
+      .populate({
+        path: "riderId",
+        select: "name phone photo current_location email",
+      })
+      .populate({
+        path: "franchiseId",
+        select: "name email phone address",
+      })
+      .populate({
+        path: "adminId",
+        select: "name email",
+      })
+      .lean();
+
+    if (!ride) {
+      return res.status(404).json(new ApiResponse(404, null, "Ride not found"));
+    }
+
+    // Get ETO ID for driver
+    const etoCard = await ETOCard.findOne({ driverId: ride.driverId?._id });
+    
+    // Format the response
+    const rideData = {
+      ...ride,
+      rideId: ride._id,
+      driver: {
+        ...ride.driverId,
+        eto_id_num: etoCard?.eto_id_num || null,
+      },
+      rider: ride.riderId,
+      franchise: ride.franchiseId,
+      admin: ride.adminId,
+    };
+
+    // Remove the original populated fields for cleaner response
+    delete rideData.driverId;
+    delete rideData.riderId;
+    delete rideData.franchiseId;
+    delete rideData.adminId;
+
+    return res
+      .status(200)
+      .json(new ApiResponse(200, rideData, "Ride details fetched successfully"));
+  } catch (error) {
+    console.error("Error fetching ride by ID:", error.message);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch ride details"));
+  }
+});
+

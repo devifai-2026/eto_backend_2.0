@@ -111,6 +111,7 @@ export const getCurrentRide = asyncHandler(async (req, res) => {
       },
     };
 
+
     // console.log("Rider Current Ride", currentRide);
     return res
       .status(200)

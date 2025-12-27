@@ -317,7 +317,7 @@ export const getAllDrivers = asyncHandler(async (req, res) => {
 
     // Execute query with pagination - select only needed fields
     const drivers = await Driver.find(baseQuery)
-      .select('_id name phone email createdAt isActive is_on_ride total_earning total_complete_rides')
+      .select('_id name phone email createdAt isActive is_on_ride total_earning total_complete_rides userId')
       .sort(sortOptions)
       .skip(skip)
       .limit(limitNum)
@@ -340,6 +340,7 @@ export const getAllDrivers = asyncHandler(async (req, res) => {
     const formattedDrivers = drivers.map(driver => {
       return {
         id: driver._id,
+        userId: driver.userId,
         name: driver.name,
         joinedDate: driver.createdAt.toISOString().split('T')[0], // YYYY-MM-DD format
         contact: {

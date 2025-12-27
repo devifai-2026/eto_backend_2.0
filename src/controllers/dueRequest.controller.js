@@ -5,6 +5,7 @@ import { DueRequest } from "../models/dueRequest.model.js";
 import { Khata } from "../models/khata.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import ApiResponse from "../utils/ApiResponse.js";
+import { Franchise } from "../models/franchise.model.js";
 
 // Create Due Request
 export const createDueRequest = asyncHandler(async (req, res) => {
@@ -136,12 +137,13 @@ export const getAllPendingDueRequests = asyncHandler(async (req, res) => {
 
 // Get a due request with driver details populated
 export const getDueRequestDetails = asyncHandler(async (req, res) => {
-  const { dueRequestId } = req.params; // Assuming the due request ID is passed as a parameter
+  const { dueRequestId } = req.params;
 
   try {
     // Find the due request and populate driver details
     const dueRequest = await DueRequest.findById(dueRequestId)
-      .populate("requestedBy", "driver_photo phone name") // Populate specific fields from the Driver model
+      .populate("requestedBy", "driver_photo phone name franchiseId") // Added franchiseId
+      .populate("adminId", "name email phone") // Populate admin details
       .exec();
 
     if (!dueRequest) {
@@ -150,23 +152,152 @@ export const getDueRequestDetails = asyncHandler(async (req, res) => {
         .json(new ApiResponse(404, null, "Due request not found"));
     }
 
+    // Find driver by userId
+    const driver = await Driver.findOne({
+      userId: dueRequest.requestedBy._id,
+    });
+
+    if (!driver) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Driver details not found"));
+    }
+
+    // Find Khata for this driver
+    const khata = await Khata.findOne({
+      driverId: driver._id,
+      adminId: dueRequest.adminId,
+    });
+
+    // Calculate profits from due_payment_details
+    let totalDriverProfit = 0;
+    let totalAdminProfit = 0;
+    let totalFranchiseProfit = 0;
+    let totalAmount = 0;
+    let rideCount = 0;
+
+    if (
+      khata &&
+      khata.due_payment_details &&
+      khata.due_payment_details.length > 0
+    ) {
+      rideCount = khata.due_payment_details.length;
+
+      khata.due_payment_details.forEach((payment) => {
+        totalDriverProfit += payment.driver_profit || 0;
+        totalAdminProfit += payment.admin_profit || 0;
+        totalFranchiseProfit += payment.franchise_profit || 0;
+        totalAmount += payment.total_price || 0;
+      });
+    }
+
+    // Get franchise details if exists
+    let franchiseDetails = null;
+    if (driver.franchiseId) {
+      const Franchise = mongoose.model("Franchise");
+      const franchise = await Franchise.findById(driver.franchiseId).select(
+        "name phone email total_earning"
+      );
+
+      if (franchise) {
+        franchiseDetails = {
+          id: franchise._id,
+          name: franchise.name,
+          phone: franchise.phone,
+          email: franchise.email,
+          totalEarning: franchise.total_earning || 0,
+        };
+      }
+    }
+
+    // Prepare response data
+    const responseData = {
+      dueRequest: {
+        _id: dueRequest._id,
+        dueAmount: dueRequest.dueAmount,
+        status: dueRequest.status,
+        paymentMethod: dueRequest.paymentMethod,
+        paidAmount: dueRequest.paidAmount,
+        paymentPhoto: dueRequest.paymentPhoto,
+        notes: dueRequest.notes,
+        createdAt: dueRequest.createdAt,
+        resolvedAt: dueRequest.resolvedAt,
+        requestedBy: dueRequest.requestedBy
+          ? {
+              id: dueRequest.requestedBy._id,
+              name: dueRequest.requestedBy.name,
+              phone: dueRequest.requestedBy.phone,
+              photo: dueRequest.requestedBy.driver_photo,
+              franchiseId: dueRequest.requestedBy.franchiseId,
+            }
+          : null,
+        admin: dueRequest.adminId
+          ? {
+              id: dueRequest.adminId._id,
+              name: dueRequest.adminId.name,
+              email: dueRequest.adminId.email,
+              phone: dueRequest.adminId.phone,
+            }
+          : null,
+      },
+      profitSummary: {
+        totalAmount: totalAmount,
+        rideCount: rideCount,
+        driverProfit: totalDriverProfit,
+        adminProfit: totalAdminProfit,
+        franchiseProfit: totalFranchiseProfit,
+        breakdown: {
+          driverPercentage:
+            totalAmount > 0
+              ? ((totalDriverProfit / totalAmount) * 100).toFixed(2)
+              : 0,
+          adminPercentage:
+            totalAmount > 0
+              ? ((totalAdminProfit / totalAmount) * 100).toFixed(2)
+              : 0,
+          franchisePercentage:
+            totalAmount > 0
+              ? ((totalFranchiseProfit / totalAmount) * 100).toFixed(2)
+              : 0,
+        },
+      },
+      khataSummary: {
+        driverDue: khata?.driverdue || 0,
+        adminDue: khata?.admindue || 0,
+        franchiseDue: khata?.franchisedue || 0,
+        totalDuePayments: khata?.due_payment_details?.length || 0,
+      },
+      franchise: franchiseDetails,
+      driverDetails: {
+        id: driver._id,
+        name: driver.name,
+        email: driver.email,
+        phone: driver.phone,
+        totalEarning: driver.total_earning || 0,
+        dueWallet: driver.due_wallet || 0,
+        cashWallet: driver.cash_wallet || 0,
+        onlineWallet: driver.online_wallet || 0,
+      },
+    };
+
     return res
       .status(200)
       .json(
         new ApiResponse(
           200,
-          { dueRequest },
-          "Due request fetched successfully."
+          responseData,
+          "Due request details fetched successfully."
         )
       );
   } catch (error) {
+    console.error("Error fetching due request details:", error);
     return res
       .status(500)
-      .json(new ApiResponse(500, null, "Failed to fetch due request"));
+      .json(new ApiResponse(500, null, "Failed to fetch due request details"));
   }
 });
 
-// Update Due Request Status and Update Driver/Admin Wallets & Earnings
+// Update Due Request Status and Update All Parties
 export const updateDueRequestStatus = asyncHandler(async (req, res) => {
   const { dueRequestId } = req.params;
   const { status, note, paymentMethod, paymentPhoto } = req.body;
@@ -187,11 +318,9 @@ export const updateDueRequestStatus = asyncHandler(async (req, res) => {
       });
     }
 
-    // Update the due wallet of the driver and admin
+    // Find driver and admin
     const driver = await Driver.findOne({ userId: dueRequest.requestedBy });
     const admin = await Admin.findById(dueRequest.adminId);
-
-    // console.log("Driver", driver);
 
     if (!driver || !admin) {
       return res.status(404).json({
@@ -199,7 +328,7 @@ export const updateDueRequestStatus = asyncHandler(async (req, res) => {
       });
     }
 
-    // Add payment details to Khata (this will be removed after approval)
+    // Find the Khata record
     const khata = await Khata.findOne({
       driverId: driver._id,
       adminId: admin._id,
@@ -220,64 +349,117 @@ export const updateDueRequestStatus = asyncHandler(async (req, res) => {
         });
       }
 
-      // Update driver and admin wallets
-      driver.total_earning += khata.driverdue; // Correctly increment total earnings
+      // Calculate totals from due_payment_details
+      let totalDriverProfit = 0;
+      let totalAdminProfit = 0;
+      let totalFranchiseProfit = 0;
+
+      khata.due_payment_details.forEach((payment) => {
+        totalDriverProfit += payment.driver_profit || 0;
+        totalAdminProfit += payment.admin_profit || 0;
+        totalFranchiseProfit += payment.franchise_profit || 0;
+      });
+
+      console.log("Calculated Profits:", {
+        driver: totalDriverProfit,
+        admin: totalAdminProfit,
+        franchise: totalFranchiseProfit,
+        totalDue: dueRequest.dueAmount,
+      });
+
+      // 1. UPDATE DRIVER
+      driver.total_earning += totalDriverProfit;
       driver.due_wallet -= dueRequest.dueAmount;
+      if (driver.due_wallet < 0) driver.due_wallet = 0;
 
+      // 2. UPDATE ADMIN
       admin.due_wallet -= dueRequest.dueAmount;
-      admin.total_earning += dueRequest.dueAmount;
+      if (admin.due_wallet < 0) admin.due_wallet = 0;
+      admin.total_earning += totalAdminProfit;
 
-      khata.driverdue -= khata.driverdue;
-      khata.admindue -= khata.admindue;
+      // 3. UPDATE FRANCHISE (if exists)
+      let franchiseUpdate = null;
+      if (driver.franchiseId && totalFranchiseProfit > 0) {
+        const franchise = await Franchise.findById(driver.franchiseId);
 
-      // Remove the payment details from Khata's due_payment_details after approval
-      khata.due_payment_details = khata.due_payment_details.filter(
-        (payment) => !payment.driverId.equals(driver._id)
-      );
+        if (franchise) {
+          franchise.total_earning =
+            (franchise.total_earning || 0) + totalFranchiseProfit;
+          franchise.due_wallet =
+            (franchise.due_wallet || 0) + totalFranchiseProfit;
+          await franchise.save();
 
-      console.log(
-        "Khata Details Before Update:",
-        JSON.stringify(khata.due_payment_details, null, 2)
-      );
-      console.log("Driver ID:", driver._id.toString());
-      console.log("Due Amount:", dueRequest.dueAmount);
+          franchiseUpdate = {
+            franchiseId: franchise._id,
+            amountAdded: totalFranchiseProfit,
+            newTotalEarning: franchise.total_earning,
+          };
+        }
+      }
 
-      await khata
-        .save()
-        .then(() => {
-          console.log("Khata updated successfully");
-        })
-        .catch((err) => {
-          console.error("Error saving Khata:", err);
-        });
+      // 4. CLEAR ALL DUES FROM KHATA
+      khata.driverdue = 0; // Clear driver due
+      khata.admindue = 0; // Clear admin due
+      khata.franchisedue = 0; // Clear franchise due
 
-      // Update the due request with status, resolved time, and payment details
+      // 5. REMOVE ALL DUE PAYMENT DETAILS
+      khata.due_payment_details = [];
+
+      // Save updated Khata
+      await khata.save();
+
+      // Update the due request
       dueRequest.status = "approved";
       dueRequest.resolvedAt = new Date();
       dueRequest.paidAmount = dueRequest.dueAmount;
       dueRequest.paymentDate = new Date();
-      dueRequest.paymentMethod = paymentMethod || "cash"; // Default to "cash" if not provided
+      dueRequest.paymentMethod = paymentMethod || "cash";
       dueRequest.paymentPhoto = paymentPhoto;
+
+      if (note) {
+        dueRequest.notes = note;
+      }
     } else if (status === "rejected") {
-      // Handle rejection status and add the rejection reason in the notes
+      // Handle rejection
       dueRequest.status = "rejected";
-      dueRequest.notes = note || "No rejection reason provided"; // Default note if none is provided
+      dueRequest.notes = note || "No rejection reason provided";
+      dueRequest.resolvedAt = new Date();
     }
 
-    // Save the updated due request
+    // Save all updates
     await dueRequest.save();
-
-    // Save the updated driver and admin details
     await driver.save();
     await admin.save();
 
     return res.status(200).json({
-      message: "Due request status updated successfully.",
+      message: "Due request processed successfully.",
+      data: {
+        driver: {
+          id: driver._id,
+          name: driver.name,
+          totalEarning: driver.total_earning,
+          dueWallet: driver.due_wallet,
+        },
+        admin: {
+          id: admin._id,
+          name: admin.name,
+          totalEarning: admin.total_earning,
+          dueWallet: admin.due_wallet,
+        },
+        khata: {
+          driverdue: khata.driverdue,
+          admindue: khata.admindue,
+          franchisedue: khata.franchisedue,
+          duePaymentsCount: khata.due_payment_details.length,
+        },
+        franchise: franchiseUpdate || { message: "No franchise involved" },
+      },
     });
   } catch (error) {
-    console.error("Error updating due request status:", error.message);
+    console.error("Error updating due request status:", error);
     return res.status(500).json({
       message: "Failed to update due request status.",
+      error: error.message,
     });
   }
 });
