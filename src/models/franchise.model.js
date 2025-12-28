@@ -180,10 +180,28 @@ const franchiseSchema = new Schema(
       default: 0,
       min: 0,
     },
+    due_wallet: {
+      type: Number,
+      default: 0,
+      min: [0, "Due wallet cannot be negative"],
+    },
     total_earnings: {
       type: Number,
       default: 0,
-      min: 0,
+      min: [0, "Total earnings cannot be negative"],
+    },
+    accumulatedAdminProfit: {
+      type: Number,
+      default: 0,
+    },
+    weeklyAccumulations: {
+      type: Map,
+      of: {
+        adminProfit: Number,
+        franchiseProfit: Number,
+        totalRides: Number,
+      },
+      default: {},
     },
     // commission_rate: {
     //   type: Number,
