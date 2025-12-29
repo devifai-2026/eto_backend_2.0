@@ -967,7 +967,6 @@ export const getFranchiseDrivers = asyncHandler(async (req, res) => {
   }
 });
 
-// Add Pincode Access to Franchise
 export const addPincodeAccess = asyncHandler(async (req, res) => {
   const { id } = req.params; // Franchise ID
   const { pincode } = req.body;
@@ -1065,6 +1064,46 @@ export const addPincodeAccess = asyncHandler(async (req, res) => {
       await Franchise.findByIdAndUpdate(id, {
         $inc: { total_drivers: driversNotOnRide.length },
       });
+
+      // 5. CRITICAL: Update Khata records for assigned drivers
+      await Khata.updateMany(
+        { driverId: { $in: driverIds } },
+        {
+          $set: {
+            franchiseId: id,
+          },
+        }
+      );
+
+      // 6. Create Khata records for drivers who don't have one yet
+      // First, find which drivers don't have Khata records
+      const existingKhatas = await Khata.find({
+        driverId: { $in: driverIds }
+      }).select('driverId');
+      
+      const existingDriverIds = existingKhatas.map(khata => khata.driverId.toString());
+      const driversWithoutKhata = driversNotOnRide.filter(
+        driver => !existingDriverIds.includes(driver._id.toString())
+      );
+
+      if (driversWithoutKhata.length > 0) {
+        // Find admin (assuming there's at least one admin)
+        const admin = await Admin.findOne();
+        
+        const khataRecords = driversWithoutKhata.map(driver => ({
+          driverId: driver._id,
+          adminId: admin ? admin._id : null,
+          franchiseId: id,
+          driverdue: 0,
+          admindue: 0,
+          franchisedue: 0,
+          due_payment_details: []
+        }));
+
+        if (khataRecords.length > 0) {
+          await Khata.insertMany(khataRecords);
+        }
+      }
     }
 
     return res.status(200).json(

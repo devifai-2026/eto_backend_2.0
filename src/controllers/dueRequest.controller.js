@@ -6,7 +6,7 @@ import { Khata } from "../models/khata.model.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import ApiResponse from "../utils/ApiResponse.js";
 import { Franchise } from "../models/franchise.model.js";
-import { RideDetails } from "../models/rideDetails.model.js";
+import { WeeklyBill } from "../models/weeklyBill.model.js";
 
 // ============================================
 // HELPER FUNCTIONS
@@ -36,38 +36,32 @@ export const createDueRequest = asyncHandler(async (req, res) => {
         .json(new ApiResponse(400, null, "Missing required fields"));
     }
 
-    // Validate ObjectId
+    // Validate ObjectIds
     if (!isValidObjectId(driverId)) {
       return res
         .status(400)
-        .json(new ApiResponse(400, null, "Invalid driver ID format"));
+        .json(new ApiResponse(400, null, "Invalid ID format"));
     }
 
     // Check if driver exists
-    const driver = await Driver.findById(driverId);
+    const driver = await Driver.findOne({ userId: driverId });
     if (!driver) {
       return res
         .status(404)
         .json(new ApiResponse(404, null, "Driver not found"));
     }
 
-    // Get admin (assuming there's one admin)
+    // Check if admin exists
     const admin = await Admin.findOne();
     if (!admin) {
       return res
         .status(404)
-        .json(
-          new ApiResponse(
-            404,
-            null,
-            "Admin not found. Please create an admin first."
-          )
-        );
+        .json(new ApiResponse(404, null, "Admin not found"));
     }
 
     // Check if driver already has pending due request
     const existingPendingRequest = await DueRequest.findOne({
-      requestedBy: driverId,
+      requestedBy: driver._id,
       requestedByModel: "Driver",
       status: "pending",
     });
@@ -99,7 +93,7 @@ export const createDueRequest = asyncHandler(async (req, res) => {
 
     // Create a new due request
     const newDueRequest = new DueRequest({
-      requestedBy: driverId,
+      requestedBy: driver._id,
       requestedByModel: "Driver",
       adminId: admin._id,
       franchiseId: driver.franchiseId || null,
@@ -117,6 +111,11 @@ export const createDueRequest = asyncHandler(async (req, res) => {
     });
 
     await newDueRequest.save();
+
+    await Driver.updateOne(
+      { _id: driver._id },
+      { $set: { hasDueRequest: true } }
+    );
 
     // Respond with success
     return res.status(201).json(
@@ -146,19 +145,49 @@ export const createDueRequest = asyncHandler(async (req, res) => {
 // GET DUE REQUESTS FOR APPROVER
 // ============================================
 export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
-  const { userId, userRole } = req.user; // Assuming user info from auth middleware
-  const { status, type } = req.query;
+  const { userId, userType, adminId, franchiseId, driverId } = req.query;
 
   try {
     let query = {};
 
     // Admin can see all due requests
-    if (userRole === "admin") {
-      query = {};
+    if (userType === "admin") {
+      if (!adminId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Admin ID is required"));
+      }
+
+      if (!isValidObjectId(adminId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid admin ID format"));
+      }
+
+      const admin = await Admin.findById(adminId);
+      if (!admin) {
+        return res
+          .status(404)
+          .json(new ApiResponse(404, null, "Admin not found"));
+      }
+
+      query = { adminId: admin._id };
     }
     // Franchise can only see requests from their drivers
-    else if (userRole === "franchise") {
-      const franchise = await Franchise.findOne({ userId });
+    else if (userType === "franchise") {
+      if (!franchiseId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Franchise ID is required"));
+      }
+
+      if (!isValidObjectId(franchiseId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+      }
+
+      const franchise = await Franchise.findById(franchiseId);
       if (!franchise) {
         return res
           .status(404)
@@ -171,8 +200,20 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
       };
     }
     // Driver can only see their own requests
-    else if (userRole === "driver") {
-      const driver = await Driver.findOne({ userId });
+    else if (userType === "driver") {
+      if (!driverId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Driver ID is required"));
+      }
+
+      if (!isValidObjectId(driverId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid driver ID format"));
+      }
+
+      const driver = await Driver.findById(driverId);
       if (!driver) {
         return res
           .status(404)
@@ -185,9 +226,12 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
       };
     } else {
       return res
-        .status(403)
-        .json(new ApiResponse(403, null, "Unauthorized access"));
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid user type"));
     }
+
+    // Apply filters
+    const { status, type } = req.query;
 
     // Apply status filter
     if (status && ["pending", "approved", "rejected"].includes(status)) {
@@ -199,14 +243,11 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
       query.requestType = type;
     }
 
-    // Get due requests with population
+    // Get due requests without dynamic populate first
     const dueRequests = await DueRequest.find(query)
       .populate({
         path: "requestedBy",
         select: "name phone email driver_photo",
-        model: function () {
-          return this.requestedByModel === "Driver" ? "Driver" : "Franchise";
-        },
       })
       .populate("adminId", "name email phone")
       .populate("franchiseId", "name phone email")
@@ -215,46 +256,58 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 });
 
     // Format response
-    const formattedRequests = dueRequests.map((request) => ({
-      _id: request._id,
-      requestType: request.requestType,
-      status: request.status,
-      dueAmount: request.dueAmount,
-      payableAmount: request.payableAmount,
-      createdAt: request.createdAt,
-      requester: request.requestedBy
-        ? {
-            id: request.requestedBy._id,
-            name: request.requestedBy.name,
-            phone: request.requestedBy.phone,
-            type: request.requestedByModel,
-          }
-        : null,
-      franchise: request.franchiseId
-        ? {
-            id: request.franchiseId._id,
-            name: request.franchiseId.name,
-          }
-        : null,
-      admin: request.adminId
-        ? {
-            id: request.adminId._id,
-            name: request.adminId.name,
-          }
-        : null,
-      approvalInfo: {
-        approvedByFranchise: request.approvedByFranchise,
-        approvedByAdmin: request.approvedByAdmin,
-        approvalLevel: request.approvalLevel,
-      },
-      notes: request.notes,
-      paymentMethod: request.paymentMethod,
-      paymentPhoto: request.paymentPhoto,
-      // Weekly bill specific
-      weekStartDate: request.weekStartDate,
-      weekEndDate: request.weekEndDate,
-      totalGeneratedAmount: request.totalGeneratedAmount,
-    }));
+    const formattedRequests = dueRequests.map((request) => {
+      let requester = null;
+
+      // Handle requester based on requestedByModel
+      if (request.requestedBy) {
+        requester = {
+          id: request.requestedBy._id,
+          name: request.requestedBy.name || "No Name",
+          phone: request.requestedBy.phone || "No Phone",
+          type: request.requestedByModel,
+        };
+
+        // Add driver specific fields
+        if (request.requestedByModel === "Driver") {
+          requester.driver_photo = request.requestedBy.driver_photo;
+        }
+      }
+
+      return {
+        _id: request._id,
+        requestType: request.requestType,
+        status: request.status,
+        dueAmount: request.dueAmount,
+        payableAmount: request.payableAmount,
+        createdAt: request.createdAt,
+        requester: requester,
+        franchise: request.franchiseId
+          ? {
+              id: request.franchiseId._id,
+              name: request.franchiseId.name || "No Name",
+            }
+          : null,
+        admin: request.adminId
+          ? {
+              id: request.adminId._id,
+              name: request.adminId.name || "No Name",
+            }
+          : null,
+        approvalInfo: {
+          approvedByFranchise: request.approvedByFranchise,
+          approvedByAdmin: request.approvedByAdmin,
+          approvalLevel: request.approvalLevel,
+        },
+        notes: request.notes,
+        paymentMethod: request.paymentMethod,
+        paymentPhoto: request.paymentPhoto,
+        // Weekly bill specific
+        weekStartDate: request.weekStartDate,
+        weekEndDate: request.weekEndDate,
+        totalGeneratedAmount: request.totalGeneratedAmount,
+      };
+    });
 
     return res.status(200).json(
       new ApiResponse(
@@ -262,7 +315,7 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
         {
           requests: formattedRequests,
           total: formattedRequests.length,
-          userRole,
+          userType,
         },
         "Due requests fetched successfully"
       )
@@ -280,8 +333,7 @@ export const getDueRequestsForApprover = asyncHandler(async (req, res) => {
 // ============================================
 export const approveDueRequest = asyncHandler(async (req, res) => {
   const { dueRequestId } = req.params;
-  const { userId, userRole } = req.user;
-  const { note, paymentMethod, paymentPhoto } = req.body;
+  const { approverId, userType, note, paymentMethod, paymentPhoto } = req.body;
 
   try {
     // Validate ID
@@ -311,23 +363,55 @@ export const approveDueRequest = asyncHandler(async (req, res) => {
         );
     }
 
+    // Validate approverId based on userType
+    if (!approverId || !userType) {
+      return res
+        .status(400)
+        .json(
+          new ApiResponse(400, null, "Approver ID and user type are required")
+        );
+    }
+
     // Authorization check
     let approver = null;
-    let approverRole = "";
 
-    if (userRole === "admin") {
-      approver = await Admin.findOne({ userId });
-      approverRole = "admin";
-    } else if (userRole === "franchise") {
-      approver = await Franchise.findOne({ userId });
-      approverRole = "franchise";
-      
+    if (userType === "admin") {
+      if (!isValidObjectId(approverId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid admin ID format"));
+      }
+
+      approver = await Admin.findById(approverId);
+      if (!approver) {
+        return res
+          .status(404)
+          .json(new ApiResponse(404, null, "Admin not found"));
+      }
+    } else if (userType === "franchise") {
+      if (!isValidObjectId(approverId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+      }
+
+      approver = await Franchise.findById(approverId);
+      if (!approver) {
+        return res
+          .status(404)
+          .json(new ApiResponse(404, null, "Franchise not found"));
+      }
+
       // Franchise can only approve requests from their drivers
-      if (!dueRequest.franchiseId || 
-          !dueRequest.franchiseId._id.equals(approver._id)) {
+      if (
+        !dueRequest.franchiseId ||
+        !dueRequest.franchiseId._id.equals(approver._id)
+      ) {
         return res
           .status(403)
-          .json(new ApiResponse(403, null, "Not authorized to approve this request"));
+          .json(
+            new ApiResponse(403, null, "Not authorized to approve this request")
+          );
       }
     } else {
       return res
@@ -335,19 +419,12 @@ export const approveDueRequest = asyncHandler(async (req, res) => {
         .json(new ApiResponse(403, null, "Unauthorized to approve requests"));
     }
 
-    if (!approver) {
-      return res
-        .status(404)
-        .json(new ApiResponse(404, null, "Approver not found"));
-    }
-
     // Process based on request type
     if (dueRequest.requestType === "driver_due") {
       await processDriverDueApproval(
         dueRequest,
         approver,
-        approverRole,
-        userRole,
+        userType,
         note,
         paymentMethod,
         paymentPhoto
@@ -356,41 +433,41 @@ export const approveDueRequest = asyncHandler(async (req, res) => {
       await processFranchiseWeeklyBillApproval(
         dueRequest,
         approver,
-        approverRole,
+        userType,
         note,
         paymentMethod,
         paymentPhoto
       );
     }
 
-    // Update request status
-    if (userRole === "franchise") {
+    // UPDATE: Single approval system - any approver can approve
+    if (userType === "franchise") {
       dueRequest.approvedByFranchise = true;
       dueRequest.franchiseApprovedAt = new Date();
       dueRequest.franchiseApprovedBy = approver._id;
-      
-      // If franchise approved and driver has no franchise, mark as approved
-      if (!dueRequest.franchiseId) {
-        dueRequest.status = "approved";
-        dueRequest.approvedByAdmin = true;
-        dueRequest.adminApprovedAt = new Date();
-        dueRequest.approvedBy = approver._id;
-      }
-    } else if (userRole === "admin") {
+      // UPDATE: Mark as approved immediately
+      dueRequest.status = "approved";
+      dueRequest.approvedByAdmin = true; // Consider it admin approved too
+      dueRequest.adminApprovedAt = new Date();
+      dueRequest.approvedBy = approver._id;
+    } else if (userType === "admin") {
       dueRequest.approvedByAdmin = true;
       dueRequest.adminApprovedAt = new Date();
       dueRequest.approvedBy = approver._id;
-      
-      // Mark as approved if franchise already approved or no franchise
-      if (dueRequest.approvedByFranchise || !dueRequest.franchiseId) {
-        dueRequest.status = "approved";
+      // UPDATE: Mark as approved immediately
+      dueRequest.status = "approved";
+      // If driver has franchise, also mark franchise approval
+      if (dueRequest.franchiseId) {
+        dueRequest.approvedByFranchise = true;
+        dueRequest.franchiseApprovedAt = new Date();
+        dueRequest.franchiseApprovedBy = approver._id;
       }
     }
 
-    // If both approvals are done, mark as approved
-    if (dueRequest.approvedByFranchise && dueRequest.approvedByAdmin) {
-      dueRequest.status = "approved";
-    }
+    // UPDATE: Remove the dual approval checks
+    // if (dueRequest.approvedByFranchise && dueRequest.approvedByAdmin) {
+    //   dueRequest.status = "approved";
+    // }
 
     dueRequest.resolvedAt = new Date();
     if (note) dueRequest.notes = note;
@@ -407,7 +484,7 @@ export const approveDueRequest = asyncHandler(async (req, res) => {
         new ApiResponse(
           200,
           { dueRequest },
-          `Due request ${dueRequest.status} successfully`
+          `Due request approved successfully by ${userType}`
         )
       );
   } catch (error) {
@@ -424,8 +501,7 @@ export const approveDueRequest = asyncHandler(async (req, res) => {
 async function processDriverDueApproval(
   dueRequest,
   approver,
-  approverRole,
-  userRole,
+  userType,
   note,
   paymentMethod,
   paymentPhoto
@@ -461,23 +537,20 @@ async function processDriverDueApproval(
     totalFranchiseProfit += payment.franchise_profit || 0;
   });
 
-  // Update based on who is approving
-  if (userRole === "admin") {
-    // Admin approving - update all balances immediately
-    await updateBalancesAfterApproval(
-      driver,
-      admin,
-      khata,
-      dueRequest,
-      totalDriverProfit,
-      totalAdminProfit,
-      totalFranchiseProfit
-    );
-  } else if (userRole === "franchise") {
-    // Franchise approving - just mark as approved by franchise
-    // Actual balance updates happen when admin approves
-    console.log(`Franchise ${approver.name} approved driver ${driver.name}'s request`);
-  }
+  // UPDATE: For single approval system, update balances immediately for both franchise and admin
+  await updateBalancesAfterApproval(
+    driver,
+    admin,
+    khata,
+    dueRequest,
+    totalDriverProfit,
+    totalAdminProfit,
+    totalFranchiseProfit
+  );
+  await Driver.updateOne(
+    { _id: driver._id },
+    { $set: { hasDueRequest: false } }
+  );
 }
 
 // ============================================
@@ -509,14 +582,15 @@ async function updateBalancesAfterApproval(
       // Accumulate franchise profit in their due_wallet
       franchise.due_wallet = (franchise.due_wallet || 0) + totalFranchiseProfit;
       // Also add to total_earnings
-      franchise.total_earnings = (franchise.total_earnings || 0) + totalFranchiseProfit;
-      
+      franchise.total_earnings =
+        (franchise.total_earnings || 0) + totalFranchiseProfit;
+
       // Track accumulated admin profit for weekly billing
       if (!franchise.accumulatedAdminProfit) {
         franchise.accumulatedAdminProfit = 0;
       }
       franchise.accumulatedAdminProfit += totalAdminProfit;
-      
+
       // Track weekly accumulation
       const currentWeek = getWeekNumber(new Date());
       if (!franchise.weeklyAccumulations) {
@@ -529,10 +603,12 @@ async function updateBalancesAfterApproval(
           totalRides: 0,
         };
       }
-      franchise.weeklyAccumulations[currentWeek].adminProfit += totalAdminProfit;
-      franchise.weeklyAccumulations[currentWeek].franchiseProfit += totalFranchiseProfit;
+      franchise.weeklyAccumulations[currentWeek].adminProfit +=
+        totalAdminProfit;
+      franchise.weeklyAccumulations[currentWeek].franchiseProfit +=
+        totalFranchiseProfit;
       franchise.weeklyAccumulations[currentWeek].totalRides += 1;
-      
+
       await franchise.save();
     }
   }
@@ -554,12 +630,12 @@ async function updateBalancesAfterApproval(
 async function processFranchiseWeeklyBillApproval(
   dueRequest,
   approver,
-  approverRole,
+  userType,
   note,
   paymentMethod,
   paymentPhoto
 ) {
-  if (approverRole !== "admin") {
+  if (userType !== "admin") {
     throw new Error("Only admin can approve franchise weekly bills");
   }
 
@@ -583,7 +659,7 @@ async function processFranchiseWeeklyBillApproval(
   // Process payment: Franchise → Admin
   // Deduct from franchise's due wallet (admin's commission)
   franchise.due_wallet -= dueRequest.payableAmount;
-  
+
   // Clear accumulated admin profit for this period
   if (franchise.accumulatedAdminProfit) {
     franchise.accumulatedAdminProfit = Math.max(
@@ -591,301 +667,13 @@ async function processFranchiseWeeklyBillApproval(
       franchise.accumulatedAdminProfit - dueRequest.payableAmount
     );
   }
-  
+
   await franchise.save();
 
   // Add to admin's total earnings
   admin.total_earning += dueRequest.adminCommissionAmount;
   await admin.save();
 }
-
-// ============================================
-// GENERATE WEEKLY BILL FOR FRANCHISE
-// ============================================
-export const generateWeeklyBill = asyncHandler(async (req, res) => {
-  const { franchiseId, weekStartDate, weekEndDate } = req.body;
-  const { userId, userRole } = req.user;
-
-  // Only admin can generate weekly bills
-  if (userRole !== "admin") {
-    return res
-      .status(403)
-      .json(new ApiResponse(403, null, "Only admin can generate weekly bills"));
-  }
-
-  try {
-    // Validate required fields
-    if (!franchiseId) {
-      return res
-        .status(400)
-        .json(new ApiResponse(400, null, "Franchise ID is required"));
-    }
-
-    // Get admin
-    const admin = await Admin.findOne({ userId });
-    if (!admin) {
-      return res
-        .status(404)
-        .json(new ApiResponse(404, null, "Admin not found"));
-    }
-
-    // Get franchise
-    const franchise = await Franchise.findById(franchiseId);
-    if (!franchise) {
-      return res
-        .status(404)
-        .json(new ApiResponse(404, null, "Franchise not found"));
-    }
-
-    // Calculate date range
-    const startDate = weekStartDate ? new Date(weekStartDate) : getWeekStartDate();
-    const endDate = weekEndDate ? new Date(weekEndDate) : getWeekEndDate(startDate);
-
-    // Get all approved driver due requests for this franchise in the period
-    const approvedDriverRequests = await DueRequest.find({
-      franchiseId: franchiseId,
-      requestType: "driver_due",
-      status: "approved",
-      adminApprovedAt: {
-        $gte: startDate,
-        $lte: endDate,
-      },
-    });
-
-    if (approvedDriverRequests.length === 0) {
-      return res
-        .status(404)
-        .json(
-          new ApiResponse(
-            404,
-            null,
-            "No approved driver due requests found for this period"
-          )
-        );
-    }
-
-    // Calculate totals from approved requests
-    let totalAdminProfit = 0;
-    let totalFranchiseProfit = 0;
-    let totalGeneratedAmount = 0;
-
-    // Also get rides for detailed calculation
-    const weeklyRides = await RideDetails.find({
-      franchiseId: franchiseId,
-      isRide_ended: true,
-      isPayment_done: true,
-      ride_end_time: {
-        $gte: startDate,
-        $lte: endDate,
-      },
-    });
-
-    if (weeklyRides.length > 0) {
-      totalGeneratedAmount = weeklyRides.reduce(
-        (sum, ride) => sum + ride.total_amount,
-        0
-      );
-      totalAdminProfit = weeklyRides.reduce(
-        (sum, ride) => sum + ride.admin_profit,
-        0
-      );
-      totalFranchiseProfit = weeklyRides.reduce(
-        (sum, ride) => sum + ride.franchise_profit,
-        0
-      );
-    } else {
-      // Fallback to approved requests if rides not found
-      totalAdminProfit = approvedDriverRequests.reduce(
-        (sum, req) => sum + (req.adminCommissionAmount || 0),
-        0
-      );
-      totalGeneratedAmount = approvedDriverRequests.reduce(
-        (sum, req) => sum + (req.totalGeneratedAmount || 0),
-        0
-      );
-    }
-
-    // Check if a bill already exists for this period
-    const existingBill = await DueRequest.findOne({
-      franchiseId: franchiseId,
-      requestType: "franchise_weekly_bill",
-      weekStartDate: startDate,
-      weekEndDate: endDate,
-      status: { $in: ["pending", "approved"] },
-    });
-
-    if (existingBill) {
-      return res
-        .status(400)
-        .json(
-          new ApiResponse(
-            400,
-            { existingBill },
-            "A bill already exists for this period"
-          )
-        );
-    }
-
-    // Create weekly bill due request (from franchise to admin)
-    const weeklyBillRequest = new DueRequest({
-      requestedBy: franchiseId,
-      requestedByModel: "Franchise",
-      adminId: admin._id,
-      franchiseId: franchiseId,
-      requestType: "franchise_weekly_bill",
-      dueAmount: totalAdminProfit,
-      payableAmount: totalAdminProfit,
-      status: "pending",
-      weekStartDate: startDate,
-      weekEndDate: endDate,
-      totalGeneratedAmount: totalGeneratedAmount,
-      franchiseCommissionAmount: totalFranchiseProfit,
-      adminCommissionAmount: totalAdminProfit,
-      notes: `Weekly bill for ${startDate.toDateString()} to ${endDate.toDateString()}`,
-      paymentMethod: "online",
-      approvalLevel: "admin_only", // Only admin can approve franchise bills
-      approvedByFranchise: false,
-      approvedByAdmin: false,
-    });
-
-    await weeklyBillRequest.save();
-
-    return res.status(201).json(
-      new ApiResponse(
-        201,
-        {
-          bill: weeklyBillRequest,
-          summary: {
-            period: `${startDate.toDateString()} to ${endDate.toDateString()}`,
-            totalRides: weeklyRides.length,
-            approvedRequests: approvedDriverRequests.length,
-            totalGeneratedAmount,
-            totalAdminProfit,
-            totalFranchiseProfit,
-          },
-          franchise: {
-            id: franchise._id,
-            name: franchise.name,
-            dueWallet: franchise.due_wallet || 0,
-            accumulatedAdminProfit: franchise.accumulatedAdminProfit || 0,
-          },
-        },
-        "Weekly bill generated successfully"
-      )
-    );
-  } catch (error) {
-    console.error("Error generating weekly bill:", error);
-    return res
-      .status(500)
-      .json(new ApiResponse(500, null, "Failed to generate weekly bill"));
-  }
-});
-
-// ============================================
-// FRANCHISE CREATES DUE REQUEST TO ADMIN (For Weekly Bill Payment)
-// ============================================
-export const createFranchiseDueRequest = asyncHandler(async (req, res) => {
-  const { franchiseId, dueAmount, notes, paymentMethod, paymentPhoto } = req.body;
-  const { userId, userRole } = req.user;
-
-  // Only franchise can create this type of request
-  if (userRole !== "franchise") {
-    return res
-      .status(403)
-      .json(new ApiResponse(403, null, "Only franchise can create this request"));
-  }
-
-  try {
-    // Get franchise
-    const franchise = await Franchise.findOne({ userId });
-    if (!franchise) {
-      return res
-        .status(404)
-        .json(new ApiResponse(404, null, "Franchise not found"));
-    }
-
-    // Get admin
-    const admin = await Admin.findOne();
-    if (!admin) {
-      return res
-        .status(404)
-        .json(new ApiResponse(404, null, "Admin not found"));
-    }
-
-    // Check if franchise has a pending weekly bill
-    const pendingWeeklyBill = await DueRequest.findOne({
-      requestedBy: franchise._id,
-      requestedByModel: "Franchise",
-      requestType: "franchise_weekly_bill",
-      status: "pending",
-    });
-
-    if (!pendingWeeklyBill) {
-      return res
-        .status(400)
-        .json(
-          new ApiResponse(
-            400,
-            null,
-            "No pending weekly bill found. Please generate a weekly bill first."
-          )
-        );
-    }
-
-    // Check if dueAmount matches the pending bill
-    if (dueAmount !== pendingWeeklyBill.payableAmount) {
-      return res
-        .status(400)
-        .json(
-          new ApiResponse(
-            400,
-            null,
-            `Amount must be exactly ${pendingWeeklyBill.payableAmount} to pay the weekly bill`
-          )
-        );
-    }
-
-    // Check if franchise has sufficient balance
-    if (franchise.due_wallet < dueAmount) {
-      return res
-        .status(400)
-        .json(
-          new ApiResponse(
-            400,
-            null,
-            `Insufficient balance. Available: ${franchise.due_wallet}, Required: ${dueAmount}`
-          )
-        );
-    }
-
-    // Update the existing weekly bill with payment details
-    pendingWeeklyBill.paymentMethod = paymentMethod || "online";
-    pendingWeeklyBill.paymentPhoto = paymentPhoto;
-    pendingWeeklyBill.notes = notes || pendingWeeklyBill.notes;
-    pendingWeeklyBill.status = "pending"; // Still needs admin approval
-
-    await pendingWeeklyBill.save();
-
-    return res.status(200).json(
-      new ApiResponse(
-        200,
-        {
-          dueRequest: pendingWeeklyBill,
-          franchise: {
-            name: franchise.name,
-            dueWallet: franchise.due_wallet,
-          },
-        },
-        "Payment request submitted for weekly bill. Waiting for admin approval."
-      )
-    );
-  } catch (error) {
-    console.error("Error creating franchise due request:", error);
-    return res
-      .status(500)
-      .json(new ApiResponse(500, null, "Failed to create payment request"));
-  }
-});
 
 // ============================================
 // HELPER FUNCTIONS
@@ -900,43 +688,85 @@ function getWeekNumber(date) {
   return `${d.getFullYear()}-W${weekNo}`;
 }
 
-function getWeekStartDate(date = new Date()) {
-  const d = new Date(date);
-  const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  d.setDate(diff);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function getWeekEndDate(startDate) {
-  const endDate = new Date(startDate);
-  endDate.setDate(endDate.getDate() + 6);
-  endDate.setHours(23, 59, 59, 999);
-  return endDate;
-}
-
 // ============================================
 // GET DUE REQUEST STATISTICS
 // ============================================
 export const getDueRequestStatistics = asyncHandler(async (req, res) => {
-  const { userId, userRole } = req.user;
-  const { startDate, endDate } = req.query;
+  const { userType, adminId, franchiseId, driverId, startDate, endDate } =
+    req.query;
 
   try {
     let matchQuery = {};
-    let franchiseId = null;
 
-    // Apply user role filters
-    if (userRole === "franchise") {
-      const franchise = await Franchise.findOne({ userId });
+    // Apply user type filters
+    if (userType === "admin") {
+      if (!adminId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Admin ID is required"));
+      }
+
+      if (!isValidObjectId(adminId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid admin ID format"));
+      }
+
+      const admin = await Admin.findById(adminId);
+      if (!admin) {
+        return res
+          .status(404)
+          .json(new ApiResponse(404, null, "Admin not found"));
+      }
+
+      matchQuery.adminId = admin._id;
+    } else if (userType === "franchise") {
+      if (!franchiseId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Franchise ID is required"));
+      }
+
+      if (!isValidObjectId(franchiseId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+      }
+
+      const franchise = await Franchise.findById(franchiseId);
       if (!franchise) {
         return res
           .status(404)
           .json(new ApiResponse(404, null, "Franchise not found"));
       }
-      franchiseId = franchise._id;
+
       matchQuery.franchiseId = franchise._id;
+    } else if (userType === "driver") {
+      if (!driverId) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Driver ID is required"));
+      }
+
+      if (!isValidObjectId(driverId)) {
+        return res
+          .status(400)
+          .json(new ApiResponse(400, null, "Invalid driver ID format"));
+      }
+
+      const driver = await Driver.findById(driverId);
+      if (!driver) {
+        return res
+          .status(404)
+          .json(new ApiResponse(404, null, "Driver not found"));
+      }
+
+      matchQuery.requestedBy = driver._id;
+      matchQuery.requestedByModel = "Driver";
+    } else {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid user type"));
     }
 
     // Date filter
@@ -972,14 +802,16 @@ export const getDueRequestStatistics = asyncHandler(async (req, res) => {
 
     // Get franchise-specific stats if franchise
     let franchiseStats = null;
-    if (franchiseId) {
+    if (franchiseId && isValidObjectId(franchiseId)) {
       const franchise = await Franchise.findById(franchiseId);
-      franchiseStats = {
-        totalEarnings: franchise.total_earnings || 0,
-        dueWallet: franchise.due_wallet || 0,
-        accumulatedAdminProfit: franchise.accumulatedAdminProfit || 0,
-        totalDrivers: franchise.total_drivers || 0,
-      };
+      if (franchise) {
+        franchiseStats = {
+          totalEarnings: franchise.total_earnings || 0,
+          dueWallet: franchise.due_wallet || 0,
+          accumulatedAdminProfit: franchise.accumulatedAdminProfit || 0,
+          totalDrivers: franchise.total_drivers || 0,
+        };
+      }
     }
 
     return res.status(200).json(
@@ -988,7 +820,7 @@ export const getDueRequestStatistics = asyncHandler(async (req, res) => {
         {
           statistics: stats,
           franchiseStats,
-          userRole,
+          userType,
         },
         "Statistics fetched successfully"
       )
@@ -998,5 +830,815 @@ export const getDueRequestStatistics = asyncHandler(async (req, res) => {
     return res
       .status(500)
       .json(new ApiResponse(500, null, "Failed to fetch statistics"));
+  }
+});
+
+// ============================================
+// GET FRANCHISE PENDING BILLS (For Manual Due Request Creation)
+// ============================================
+export const getFranchisePendingBills = asyncHandler(async (req, res) => {
+  const { franchiseId } = req.params;
+
+  try {
+    const franchise = await Franchise.findById(franchiseId);
+    if (!franchise) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Franchise not found"));
+    }
+
+    // Get auto-generated bills that need manual due request creation
+    const pendingBills = await WeeklyBill.find({
+      franchiseId: franchise._id,
+      isAutoGenerated: true,
+      dueRequestCreated: false,
+      status: "generated",
+    })
+      .sort({ createdAt: -1 })
+      .populate("adminId", "name email");
+
+    // Format bills for frontend
+    const formattedBills = pendingBills.map((bill) => ({
+      id: bill._id,
+      billNumber: `BILL-${bill._id.toString().slice(-8).toUpperCase()}`,
+      period: `${bill.weekStartDate.toLocaleDateString()} - ${bill.weekEndDate.toLocaleDateString()}`,
+      weekStartDate: bill.weekStartDate,
+      weekEndDate: bill.weekEndDate,
+      dueAmount: bill.dueAmount,
+      generatedAt: bill.createdAt,
+      summary: {
+        totalGeneratedAmount: bill.totalGeneratedAmount,
+        adminCommission: bill.adminCommissionAmount,
+        franchiseCommission: bill.franchiseCommissionAmount,
+      },
+      canCreateDueRequest: franchise.due_wallet >= bill.dueAmount,
+      insufficientBalance: franchise.due_wallet < bill.dueAmount,
+      availableBalance: franchise.due_wallet,
+      notes: bill.notes,
+    }));
+
+    // Get already created due requests for these bills
+    const existingDueRequests = await DueRequest.find({
+      franchiseId: franchise._id,
+      weeklyBillId: { $in: pendingBills.map((b) => b._id) },
+    });
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          franchise: {
+            id: franchise._id,
+            name: franchise.name,
+            phone: franchise.phone,
+            dueWallet: franchise.due_wallet,
+            totalEarnings: franchise.total_earnings,
+            nextBillDate: franchise.nextBillGenerationDate,
+          },
+          pendingBills: formattedBills,
+          summary: {
+            totalBills: formattedBills.length,
+            totalDueAmount: formattedBills.reduce(
+              (sum, bill) => sum + bill.dueAmount,
+              0
+            ),
+            payableBills: formattedBills.filter((b) => b.canCreateDueRequest)
+              .length,
+            payableAmount: formattedBills
+              .filter((b) => b.canCreateDueRequest)
+              .reduce((sum, bill) => sum + bill.dueAmount, 0),
+            existingDueRequests: existingDueRequests.length,
+          },
+          instructions: [
+            "1. Bills are auto-generated every week",
+            "2. You need to manually create due request for each bill",
+            "3. Admin will approve your payment request",
+            "4. Ensure sufficient balance in your due wallet",
+          ],
+        },
+        "Pending bills fetched successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error fetching pending bills:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch pending bills"));
+  }
+});
+
+// ============================================
+// FRANCHISE CREATES DUE REQUEST FROM AUTO-GENERATED BILL
+// ============================================
+export const createFranchiseDueRequest = asyncHandler(async (req, res) => {
+  const { billId, paymentMethod = "online", paymentPhoto, notes } = req.body;
+  const { franchiseId } = req.params; // From URL params
+
+  try {
+    // Validate
+    if (!billId || !franchiseId) {
+      return res
+        .status(400)
+        .json(
+          new ApiResponse(400, null, "Bill ID and Franchise ID are required")
+        );
+    }
+
+    // Check IDs
+    if (!isValidObjectId(billId) || !isValidObjectId(franchiseId)) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid ID format"));
+    }
+
+    // Get franchise
+    const franchise = await Franchise.findById(franchiseId);
+    if (!franchise) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Franchise not found"));
+    }
+
+    // Get the auto-generated bill
+    const bill = await WeeklyBill.findById(billId);
+    if (!bill) {
+      return res.status(404).json(new ApiResponse(404, null, "Bill not found"));
+    }
+
+    // Check if bill belongs to this franchise
+    if (!bill.franchiseId.equals(franchise._id)) {
+      return res
+        .status(403)
+        .json(
+          new ApiResponse(
+            403,
+            null,
+            "This bill does not belong to your franchise"
+          )
+        );
+    }
+
+    // Check if bill already has a due request
+    if (bill.dueRequestCreated) {
+      return res
+        .status(400)
+        .json(
+          new ApiResponse(
+            400,
+            null,
+            "A due request already exists for this bill"
+          )
+        );
+    }
+
+    // Check bill status
+    if (bill.status !== "generated") {
+      return res
+        .status(400)
+        .json(
+          new ApiResponse(
+            400,
+            null,
+            `Cannot create due request for bill with status: ${bill.status}`
+          )
+        );
+    }
+
+    // Check if franchise has sufficient balance
+    if (franchise.due_wallet < bill.dueAmount) {
+      return res
+        .status(400)
+        .json(
+          new ApiResponse(
+            400,
+            null,
+            `Insufficient balance. Available: ₹${franchise.due_wallet}, Required: ₹${bill.dueAmount}`
+          )
+        );
+    }
+
+    // Get admin
+    const admin = await Admin.findById(bill.adminId);
+    if (!admin) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Admin not found"));
+    }
+
+    // 1. CREATE DUE REQUEST
+    const dueRequest = new DueRequest({
+      requestedBy: franchise._id,
+      requestedByModel: "Franchise",
+      adminId: admin._id,
+      franchiseId: franchise._id,
+      requestType: "franchise_weekly_bill",
+      dueAmount: bill.dueAmount,
+      payableAmount: bill.dueAmount,
+      status: "pending",
+      weekStartDate: bill.weekStartDate,
+      weekEndDate: bill.weekEndDate,
+      totalGeneratedAmount: bill.totalGeneratedAmount,
+      franchiseCommissionAmount: bill.franchiseCommissionAmount,
+      adminCommissionAmount: bill.adminCommissionAmount,
+      notes: notes || `Manual payment request for bill: ${bill._id}`,
+      paymentMethod: paymentMethod,
+      paymentPhoto: paymentPhoto,
+      approvalLevel: "admin_only",
+      approvedByFranchise: false,
+      approvedByAdmin: false,
+      isAutoGenerated: false, // Manual creation
+      weeklyBillId: bill._id, // Link to the bill
+    });
+
+    await dueRequest.save();
+
+    // 2. UPDATE BILL STATUS
+    bill.dueRequestCreated = true;
+    bill.dueRequestCreatedAt = new Date();
+    bill.dueRequestId = dueRequest._id;
+    bill.status = "pending_payment";
+
+    if (paymentMethod) {
+      if (!bill.paymentDetails) bill.paymentDetails = {};
+      bill.paymentDetails.paymentMethod = paymentMethod;
+    }
+    if (paymentPhoto) {
+      if (!bill.paymentDetails) bill.paymentDetails = {};
+      bill.paymentDetails.paymentPhoto = paymentPhoto;
+    }
+
+    await bill.save();
+
+    return res.status(201).json(
+      new ApiResponse(
+        201,
+        {
+          dueRequest: {
+            id: dueRequest._id,
+            billId: bill._id,
+            amount: dueRequest.dueAmount,
+            status: dueRequest.status,
+            createdAt: dueRequest.createdAt,
+            paymentMethod: dueRequest.paymentMethod,
+          },
+          bill: {
+            id: bill._id,
+            period: `${bill.weekStartDate.toLocaleDateString()} - ${bill.weekEndDate.toLocaleDateString()}`,
+            dueAmount: bill.dueAmount,
+            status: bill.status,
+          },
+          franchise: {
+            id: franchise._id,
+            name: franchise.name,
+            dueWallet: franchise.due_wallet,
+            newBalanceIfApproved: franchise.due_wallet - bill.dueAmount,
+          },
+          message:
+            "Due request created successfully. Waiting for admin approval.",
+        },
+        "Due request created from bill successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error creating due request from bill:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to create due request"));
+  }
+});
+
+// ============================================
+// GET FRANCHISE BILLING DASHBOARD
+// ============================================
+export const getFranchiseBillingDashboard = asyncHandler(async (req, res) => {
+  const { franchiseId } = req.params;
+
+  try {
+    const franchise = await Franchise.findById(franchiseId);
+    if (!franchise) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Franchise not found"));
+    }
+
+    // Get recent auto-generated bills
+    const recentBills = await WeeklyBill.find({
+      franchiseId: franchise._id,
+      isAutoGenerated: true,
+    })
+      .sort({ createdAt: -1 })
+      .limit(10);
+
+    // Get due requests
+    const dueRequests = await DueRequest.find({
+      franchiseId: franchise._id,
+      requestType: "franchise_weekly_bill",
+    })
+      .sort({ createdAt: -1 })
+      .limit(10);
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          franchise: {
+            id: franchise._id,
+            name: franchise.name,
+            dueWallet: franchise.due_wallet,
+            accumulatedAdminProfit: franchise.accumulatedAdminProfit,
+            nextBillGenerationDate: franchise.nextBillGenerationDate,
+          },
+          recentBills: recentBills.map((bill) => ({
+            id: bill._id,
+            period: `${bill.weekStartDate.toLocaleDateString()} - ${bill.weekEndDate.toLocaleDateString()}`,
+            amount: bill.dueAmount,
+            status: bill.status,
+            createdAt: bill.createdAt,
+          })),
+          dueRequests: dueRequests.map((req) => ({
+            id: req._id,
+            amount: req.dueAmount,
+            status: req.status,
+            createdAt: req.createdAt,
+          })),
+          summary: {
+            totalBills: await WeeklyBill.countDocuments({
+              franchiseId: franchise._id,
+            }),
+            pendingBills: await WeeklyBill.countDocuments({
+              franchiseId: franchise._id,
+              status: "generated",
+              dueRequestCreated: false,
+            }),
+            totalDueAmount: recentBills
+              .filter((b) => b.status === "generated" && !b.dueRequestCreated)
+              .reduce((sum, b) => sum + b.dueAmount, 0),
+          },
+        },
+        "Franchise billing dashboard fetched successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error fetching franchise dashboard:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch dashboard"));
+  }
+});
+
+// ============================================
+// GET SINGLE DUE REQUEST BY ID
+// ============================================
+export const getDueRequestById = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    if (!isValidObjectId(id)) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid due request ID"));
+    }
+
+    // First get the due request without weeklyBillId populate
+    const dueRequest = await DueRequest.findById(id)
+      .populate({
+        path: "requestedBy",
+        select: "name phone email",
+      })
+      .populate("adminId", "name email phone")
+      .populate("franchiseId", "name email phone")
+      .populate("approvedBy", "name email");
+    // Remove .populate("weeklyBillId") - since it's not in schema
+
+    if (!dueRequest) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Due request not found"));
+    }
+
+    // Format the response
+    const formattedDueRequest = {
+      _id: dueRequest._id,
+      requestedBy: dueRequest.requestedBy,
+      requestedByModel: dueRequest.requestedByModel,
+      adminId: dueRequest.adminId,
+      franchiseId: dueRequest.franchiseId,
+      dueAmount: dueRequest.dueAmount,
+      payableAmount: dueRequest.payableAmount,
+      requestType: dueRequest.requestType,
+      status: dueRequest.status,
+      weekStartDate: dueRequest.weekStartDate,
+      weekEndDate: dueRequest.weekEndDate,
+      totalGeneratedAmount: dueRequest.totalGeneratedAmount,
+      franchiseCommissionAmount: dueRequest.franchiseCommissionAmount,
+      adminCommissionAmount: dueRequest.adminCommissionAmount,
+      notes: dueRequest.notes,
+      resolvedAt: dueRequest.resolvedAt,
+      resolvedBy: dueRequest.resolvedBy,
+      paymentMethod: dueRequest.paymentMethod,
+      paidAmount: dueRequest.paidAmount,
+      paymentDate: dueRequest.paymentDate,
+      paymentPhoto: dueRequest.paymentPhoto,
+      approvalLevel: dueRequest.approvalLevel,
+      approvedByFranchise: dueRequest.approvedByFranchise,
+      approvedByAdmin: dueRequest.approvedByAdmin,
+      franchiseApprovedAt: dueRequest.franchiseApprovedAt,
+      franchiseApprovedBy: dueRequest.franchiseApprovedBy,
+      adminApprovedAt: dueRequest.adminApprovedAt,
+      approvedBy: dueRequest.approvedBy,
+      approvedByModel: dueRequest.approvedByModel,
+      // Remove weeklyBillId from here
+      createdAt: dueRequest.createdAt,
+      updatedAt: dueRequest.updatedAt,
+    };
+
+    // Create requester info based on requestedByModel
+    let requesterInfo = null;
+    if (dueRequest.requestedBy) {
+      requesterInfo = {
+        id: dueRequest.requestedBy._id,
+        name: dueRequest.requestedBy.name || "No Name",
+        phone: dueRequest.requestedBy.phone || "No Phone",
+        email: dueRequest.requestedBy.email || "No Email",
+        type: dueRequest.requestedByModel,
+      };
+    }
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          dueRequest: formattedDueRequest,
+          requester: requesterInfo,
+          summary: {
+            requestType: dueRequest.requestType,
+            status: dueRequest.status,
+            amount: dueRequest.dueAmount,
+            createdAt: dueRequest.createdAt,
+            requesterType: dueRequest.requestedByModel,
+          },
+        },
+        "Due request fetched successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error fetching due request by ID:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch due request"));
+  }
+});
+
+// ============================================
+// GET FRANCHISE DUE REQUEST HISTORY
+// ============================================
+export const getFranchiseDueRequestHistory = asyncHandler(async (req, res) => {
+  const { franchiseId } = req.params;
+  const { status, limit = 20, page = 1, startDate, endDate } = req.query;
+
+  try {
+    if (!franchiseId) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Franchise ID is required"));
+    }
+
+    if (!isValidObjectId(franchiseId)) {
+      return res
+        .status(400)
+        .json(new ApiResponse(400, null, "Invalid franchise ID format"));
+    }
+
+    const franchise = await Franchise.findById(franchiseId);
+    if (!franchise) {
+      return res
+        .status(404)
+        .json(new ApiResponse(404, null, "Franchise not found"));
+    }
+
+    // Build query
+    const query = {
+      franchiseId: franchise._id,
+      requestType: "franchise_weekly_bill",
+    };
+
+    // Apply filters
+    if (status && ["pending", "approved", "rejected"].includes(status)) {
+      query.status = status;
+    }
+
+    // Date filters
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        query.createdAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = end;
+      }
+    }
+
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const limitNum = parseInt(limit);
+
+    // Get due requests
+    const dueRequests = await DueRequest.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .populate("adminId", "name email phone")
+      .populate("weeklyBillId")
+      .populate({
+        path: "requestedBy",
+        select: "name phone email",
+        model: "Franchise",
+      });
+
+    // Get total count
+    const total = await DueRequest.countDocuments(query);
+
+    // Calculate totals
+    const totals = await DueRequest.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$dueAmount" },
+        },
+      },
+    ]);
+
+    // Format response
+    const formattedRequests = dueRequests.map((request) => ({
+      id: request._id,
+      requestType: request.requestType,
+      status: request.status,
+      dueAmount: request.dueAmount,
+      payableAmount: request.payableAmount,
+      createdAt: request.createdAt,
+      admin: request.adminId
+        ? {
+            id: request.adminId._id,
+            name: request.adminId.name,
+            email: request.adminId.email,
+          }
+        : null,
+      bill: request.weeklyBillId
+        ? {
+            id: request.weeklyBillId._id,
+            weekStartDate: request.weeklyBillId.weekStartDate,
+            weekEndDate: request.weeklyBillId.weekEndDate,
+          }
+        : null,
+      paymentInfo: {
+        paymentMethod: request.paymentMethod,
+        paymentPhoto: request.paymentPhoto,
+        paidAmount: request.paidAmount,
+        paymentDate: request.paymentDate,
+      },
+      notes: request.notes,
+      approvalInfo: {
+        approvedByFranchise: request.approvedByFranchise,
+        approvedByAdmin: request.approvedByAdmin,
+        franchiseApprovedAt: request.franchiseApprovedAt,
+        adminApprovedAt: request.adminApprovedAt,
+      },
+    }));
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          franchise: {
+            id: franchise._id,
+            name: franchise.name,
+            phone: franchise.phone,
+            email: franchise.email,
+          },
+          dueRequests: formattedRequests,
+          summary: {
+            totals: totals.reduce((acc, curr) => {
+              acc[curr._id] = {
+                count: curr.count,
+                totalAmount: curr.totalAmount,
+              };
+              return acc;
+            }, {}),
+            totalRequests: total,
+            totalAmount: totals.reduce(
+              (sum, curr) => sum + curr.totalAmount,
+              0
+            ),
+            pendingAmount:
+              totals.find((t) => t._id === "pending")?.totalAmount || 0,
+            approvedAmount:
+              totals.find((t) => t._id === "approved")?.totalAmount || 0,
+          },
+          pagination: {
+            page: parseInt(page),
+            limit: limitNum,
+            total,
+            pages: Math.ceil(total / limitNum),
+          },
+        },
+        "Franchise due request history fetched successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error fetching franchise due request history:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch franchise history"));
+  }
+});
+
+// ============================================
+// GET ADMIN AUTO-GENERATED BILLS
+// ============================================
+export const getAdminAutoGeneratedBills = asyncHandler(async (req, res) => {
+  const {
+    status,
+    franchiseId,
+    limit = 50,
+    page = 1,
+    startDate,
+    endDate,
+  } = req.query;
+
+  try {
+    // Build query
+    const query = { isAutoGenerated: true };
+
+    // Apply filters
+    if (
+      status &&
+      ["generated", "pending_payment", "paid", "cancelled"].includes(status)
+    ) {
+      query.status = status;
+    }
+
+    if (franchiseId && isValidObjectId(franchiseId)) {
+      query.franchiseId = franchiseId;
+    }
+
+    // Date filters
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) {
+        const start = new Date(startDate);
+        start.setHours(0, 0, 0, 0);
+        query.createdAt.$gte = start;
+      }
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = end;
+      }
+    }
+
+    // Pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const limitNum = parseInt(limit);
+
+    // Get weekly bills
+    const weeklyBills = await WeeklyBill.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .populate("franchiseId", "name phone email due_wallet")
+      .populate("adminId", "name email")
+      .populate("dueRequestId");
+
+    // Get total count
+    const total = await WeeklyBill.countDocuments(query);
+
+    // Calculate summary stats
+    const summaryStats = await WeeklyBill.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+          totalAmount: { $sum: "$dueAmount" },
+          avgAmount: { $avg: "$dueAmount" },
+        },
+      },
+    ]);
+
+    // Calculate overall totals
+    const overallTotals = await WeeklyBill.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalBills: { $sum: 1 },
+          totalAmount: { $sum: "$dueAmount" },
+          avgAmount: { $avg: "$dueAmount" },
+        },
+      },
+    ]);
+
+    // Format response
+    const formattedBills = weeklyBills.map((bill) => ({
+      id: bill._id,
+      billNumber: `BILL-${bill._id.toString().slice(-8).toUpperCase()}`,
+      period: `${bill.weekStartDate.toLocaleDateString()} - ${bill.weekEndDate.toLocaleDateString()}`,
+      weekStartDate: bill.weekStartDate,
+      weekEndDate: bill.weekEndDate,
+      dueAmount: bill.dueAmount,
+      status: bill.status,
+      isAutoGenerated: bill.isAutoGenerated,
+      dueRequestCreated: bill.dueRequestCreated,
+      createdAt: bill.createdAt,
+      franchise: bill.franchiseId
+        ? {
+            id: bill.franchiseId._id,
+            name: bill.franchiseId.name,
+            phone: bill.franchiseId.phone,
+            email: bill.franchiseId.email,
+            dueWallet: bill.franchiseId.due_wallet,
+          }
+        : null,
+      admin: bill.adminId
+        ? {
+            id: bill.adminId._id,
+            name: bill.adminId.name,
+            email: bill.adminId.email,
+          }
+        : null,
+      dueRequest: bill.dueRequestId
+        ? {
+            id: bill.dueRequestId._id,
+            status: bill.dueRequestId.status,
+            createdAt: bill.dueRequestId.createdAt,
+          }
+        : null,
+      paymentDetails: bill.paymentDetails || null,
+      notes: bill.notes,
+      summary: {
+        totalGeneratedAmount: bill.totalGeneratedAmount,
+        adminCommissionAmount: bill.adminCommissionAmount,
+        franchiseCommissionAmount: bill.franchiseCommissionAmount,
+      },
+    }));
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          weeklyBills: formattedBills,
+          summary: {
+            totalBills: total,
+            totalAmount: overallTotals[0]?.totalAmount || 0,
+            avgAmount: overallTotals[0]?.avgAmount || 0,
+            statusBreakdown: summaryStats.reduce((acc, stat) => {
+              acc[stat._id] = {
+                count: stat.count,
+                totalAmount: stat.totalAmount,
+                avgAmount: stat.avgAmount,
+              };
+              return acc;
+            }, {}),
+            pendingBills: await WeeklyBill.countDocuments({
+              ...query,
+              status: "generated",
+              dueRequestCreated: false,
+            }),
+            billsWithDueRequest: await WeeklyBill.countDocuments({
+              ...query,
+              dueRequestCreated: true,
+            }),
+            paidBills: await WeeklyBill.countDocuments({
+              ...query,
+              status: "paid",
+            }),
+          },
+          pagination: {
+            page: parseInt(page),
+            limit: limitNum,
+            total,
+            pages: Math.ceil(total / limitNum),
+          },
+          filters: {
+            status: status || "all",
+            franchiseId: franchiseId || "all",
+            startDate: startDate || "all",
+            endDate: endDate || "all",
+          },
+        },
+        "Admin auto-generated bills fetched successfully"
+      )
+    );
+  } catch (error) {
+    console.error("Error fetching admin auto-generated bills:", error);
+    return res
+      .status(500)
+      .json(new ApiResponse(500, null, "Failed to fetch admin auto bills"));
   }
 });

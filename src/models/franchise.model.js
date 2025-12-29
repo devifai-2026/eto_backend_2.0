@@ -166,7 +166,7 @@ const franchiseSchema = new Schema(
     },
     isApproved: {
       type: Boolean,
-      default: false,
+      default: true,
     },
     createdBy: {
       type: Schema.Types.ObjectId,
@@ -203,14 +203,25 @@ const franchiseSchema = new Schema(
       },
       default: {},
     },
-    // commission_rate: {
-    //   type: Number,
-    //   default: 10, // Default commission percentage
-    //   min: 0,
-    //   max: 100,
-    // },
+     lastWeeklyBillGeneratedAt: {
+      type: Date,
+      default: null,
+    },
 
-    // Login and Session
+    nextBillGenerationDate: {
+      type: Date,
+      default: function() {
+        // 1 week from creation date
+        const date = new Date();
+        date.setDate(date.getDate() + 7);
+        return date;
+      },
+    },
+
+    autoBillGenerationEnabled: {
+      type: Boolean,
+      default: true,
+    },
     userId: {
       type: Schema.Types.ObjectId,
       ref: "User",

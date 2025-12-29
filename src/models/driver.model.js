@@ -163,6 +163,10 @@ const driverSchema = new Schema(
       type: String,
       default: "",
     },
+    hasDueRequest: {
+      type: Boolean,
+      default: false
+    }
   },
   {
     timestamps: true,

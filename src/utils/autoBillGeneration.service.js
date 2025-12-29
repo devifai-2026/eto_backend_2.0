@@ -1,0 +1,226 @@
+import cron from "node-cron";
+import { Franchise } from "../models/franchise.model.js";
+import { Admin } from "../models/admin.model.js";
+import { WeeklyBill } from "../models/weeklyBill.model.js";
+import { RideDetails } from "../models/rideDetails.model.js";
+
+class AutoBillGenerationService {
+  constructor() {
+    this.startCronJob();
+  }
+
+  startCronJob() {
+    // Per 6 hour(midnight, 6am, noon, 6pm)
+    cron.schedule("0 */6 * * *", async () => {
+      console.log("Running automatic bill generation check...");
+      await this.checkAndGenerateBills();
+    });
+
+    // প্Per 1 hour (for testing)
+    cron.schedule("0 */1 * * *", async () => {
+      console.log("Running hourly franchise due check...");
+      await this.checkFranchiseDueStatus();
+    });
+  }
+
+  async checkAndGenerateBills() {
+    try {
+      const now = new Date();
+
+      // Find franchises that are ready for bill generation
+      const franchises = await Franchise.find({
+        isActive: true,
+        isApproved: true,
+        autoBillGenerationEnabled: true,
+        $or: [
+          { nextBillGenerationDate: { $lte: now } },
+          { nextBillGenerationDate: null },
+        ],
+      });
+
+      console.log(
+        `Found ${franchises.length} franchises for bill generation check`
+      );
+
+      for (const franchise of franchises) {
+        try {
+          await this.generateBillForFranchise(franchise);
+        } catch (error) {
+          console.error(
+            `Error generating bill for franchise ${franchise._id}:`,
+            error
+          );
+          continue;
+        }
+      }
+    } catch (error) {
+      console.error("Error in auto bill generation:", error);
+    }
+  }
+
+  async generateBillForFranchise(franchise) {
+    // Get admin
+    const admin = await Admin.findOne();
+    if (!admin) {
+      console.warn("Admin not found. Skipping bill generation.");
+      return;
+    }
+
+    // Check if franchise has accumulated due
+    if ((franchise.accumulatedAdminProfit || 0) <= 0) {
+      console.log(
+        `Franchise ${franchise.name} has no accumulated due. Skipping.`
+      );
+      // Update next bill date
+      franchise.nextBillGenerationDate = new Date(
+        Date.now() + 7 * 24 * 60 * 60 * 1000
+      );
+      await franchise.save();
+      return;
+    }
+
+    // Calculate date range (last week)
+    let weekStartDate;
+    if (franchise.lastWeeklyBillGeneratedAt) {
+      weekStartDate = new Date(franchise.lastWeeklyBillGeneratedAt);
+      weekStartDate.setDate(weekStartDate.getDate() + 1); // Next day after last bill
+    } else {
+      weekStartDate = new Date(franchise.createdAt);
+    }
+
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekEndDate.getDate() + 6); // 7 days total
+    weekEndDate.setHours(23, 59, 59, 999);
+
+    // Check if dates are valid
+    if (weekStartDate >= new Date()) {
+      console.log(
+        `Invalid date range for franchise ${franchise.name}. Skipping.`
+      );
+      return;
+    }
+
+    // Get rides for this period
+    const weeklyRides = await RideDetails.find({
+      franchiseId: franchise._id,
+      isRide_ended: true,
+      isPayment_done: true,
+      ride_end_time: {
+        $gte: weekStartDate,
+        $lte: weekEndDate,
+      },
+    });
+
+    // Calculate totals
+    const totalGeneratedAmount = weeklyRides.reduce(
+      (sum, ride) => sum + (ride.total_amount || 0),
+      0
+    );
+
+    const totalAdminProfit = weeklyRides.reduce(
+      (sum, ride) => sum + (ride.admin_profit || 0),
+      0
+    );
+
+    const totalFranchiseProfit = weeklyRides.reduce(
+      (sum, ride) => sum + (ride.franchise_profit || 0),
+      0
+    );
+
+    // Use accumulated profit if no rides found
+    const dueAmount =
+      weeklyRides.length > 0
+        ? totalAdminProfit
+        : franchise.accumulatedAdminProfit || 0;
+
+    if (dueAmount <= 0) {
+      console.log(`No due amount for franchise ${franchise.name}. Skipping.`);
+      // Update next bill date
+      franchise.nextBillGenerationDate = new Date(
+        Date.now() + 7 * 24 * 60 * 60 * 1000
+      );
+      await franchise.save();
+      return;
+    }
+
+    // Check if bill already exists for this period
+    const existingBill = await WeeklyBill.findOne({
+      franchiseId: franchise._id,
+      weekStartDate: weekStartDate,
+      weekEndDate: weekEndDate,
+      status: { $in: ["generated", "pending_payment"] },
+    });
+
+    if (existingBill) {
+      console.log(
+        `Bill already exists for franchise ${franchise.name} for this period.`
+      );
+      return;
+    }
+
+
+    // Create Weekly Bill
+    const weeklyBill = new WeeklyBill({
+      franchiseId: franchise._id,
+      adminId: admin._id,
+      weekStartDate: weekStartDate,
+      weekEndDate: weekEndDate,
+      totalGeneratedAmount: totalGeneratedAmount,
+      adminCommissionAmount: totalAdminProfit,
+      franchiseCommissionAmount: totalFranchiseProfit,
+      dueAmount: dueAmount,
+      status: "generated", // Just generated, not pending payment yet
+      isAutoGenerated: true,
+      dueRequestCreated: false, // Important: no due request created yet
+      notes: `Automatically generated weekly bill for ${weekStartDate.toLocaleDateString()} to ${weekEndDate.toLocaleDateString()}. Franchise needs to create due request manually.`,
+    });
+
+    await weeklyBill.save();
+
+    // Update franchise accumulated profit
+    franchise.accumulatedAdminProfit = Math.max(
+      0,
+      (franchise.accumulatedAdminProfit || 0) - dueAmount
+    );
+
+    // Update franchise
+    franchise.lastWeeklyBillGeneratedAt = new Date();
+    franchise.nextBillGenerationDate = new Date(
+      Date.now() + 7 * 24 * 60 * 60 * 1000
+    );
+
+    await franchise.save();
+
+    console.log(
+      `Auto-generated weekly bill for franchise: ${franchise.name}, Amount: ${dueAmount}`
+    );
+    console.log(
+      `NOTE: Franchise needs to manually create due request for this bill.`
+    );
+  }
+
+  async checkFranchiseDueStatus() {
+    try {
+      const franchises = await Franchise.find({
+        isActive: true,
+        isApproved: true,
+      }).select(
+        "name due_wallet accumulatedAdminProfit nextBillGenerationDate"
+      );
+
+      const statusList = franchises.map((franchise) => ({
+        id: franchise._id,
+        name: franchise.name,
+        dueWallet: franchise.due_wallet || 0,
+        accumulatedAdminProfit: franchise.accumulatedAdminProfit || 0,
+        nextBillDate: franchise.nextBillGenerationDate,
+      }));
+
+      console.log("Franchise Due Status:", statusList);
+    } catch (error) {
+      console.error("Error checking franchise due status:", error);
+    }
+  }
+}
+
+export default new AutoBillGenerationService();
