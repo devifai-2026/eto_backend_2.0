@@ -1363,63 +1363,255 @@ export const getTopDrivers = asyncHandler(async (req, res) => {
 // Get all drivers with isApproved = false
 export const getUnapprovedDrivers = asyncHandler(async (req, res) => {
   try {
-    // Find drivers where isApproved is false
-    const unapprovedDrivers = await Driver.find({ isApproved: false });
+    const { adminId, franchiseId } = req.query;
+
+    // Validate IDs
+    if (adminId && !mongoose.Types.ObjectId.isValid(adminId)) {
+      return res.status(400).json(
+        new ApiResponse(400, null, "Invalid admin ID format")
+      );
+    }
+
+    if (franchiseId && !mongoose.Types.ObjectId.isValid(franchiseId)) {
+      return res.status(400).json(
+        new ApiResponse(400, null, "Invalid franchise ID format")
+      );
+    }
+
+    // Build query object
+    const query = { isApproved: false };
+
+    // Apply franchise filter if franchiseId is provided
+    if (franchiseId) {
+      // Only show drivers assigned to this specific franchise
+      query.franchiseId = franchiseId;
+      
+      // Optionally verify franchise exists
+      const franchise = await Franchise.findById(franchiseId);
+      if (!franchise) {
+        return res.status(404).json(
+          new ApiResponse(404, null, "Franchise not found")
+        );
+      }
+    } else if (adminId) {
+      // Admin can see all unapproved drivers (both with and without franchise)
+      // No franchise filter applied
+      
+      // Optionally verify admin exists
+      const admin = await Admin.findById(adminId);
+      if (!admin) {
+        return res.status(404).json(
+          new ApiResponse(404, null, "Admin not found")
+        );
+      }
+    } else {
+      // If neither adminId nor franchiseId is provided, return error
+      return res.status(400).json(
+        new ApiResponse(400, null, "Either adminId or franchiseId is required")
+      );
+    }
+
+    // Find unapproved drivers with optional population
+    const unapprovedDrivers = await Driver.find(query)
+      .populate({
+        path: 'franchiseId',
+        select: 'name email phone'
+      })
+      .sort({ createdAt: -1 }); // Sort by newest first
 
     if (unapprovedDrivers.length === 0) {
-      return res
-        .status(200)
-        .json(new ApiResponse(200, null, "No unapproved drivers found"));
+      const message = franchiseId 
+        ? "No unapproved drivers found for this franchise"
+        : "No unapproved drivers found";
+      
+      return res.status(200).json(
+        new ApiResponse(200, { drivers: [], count: 0 }, message)
+      );
+    }
+
+    // Format response data
+    const formattedDrivers = unapprovedDrivers.map(driver => ({
+      _id: driver._id,
+      userId: driver.userId,
+      name: driver.name,
+      phone: driver.phone,
+      email: driver.email,
+      license_number: driver.license_number,
+      pin_code: driver.pin_code,
+      car_photo: driver.car_photo,
+      village: driver.village,
+      police_station: driver.police_station,
+      landmark: driver.landmark,
+      post_office: driver.post_office,
+      district: driver.district,
+      driver_photo: driver.driver_photo,
+      aadhar_front_photo: driver.aadhar_front_photo,
+      aadhar_back_photo: driver.aadhar_back_photo,
+      
+      isActive: driver.isActive,
+      createdAt: driver.createdAt,
+      franchise: driver.franchiseId ? {
+        _id: driver.franchiseId._id,
+        name: driver.franchiseId.name,
+        email: driver.franchiseId.email,
+        phone: driver.franchiseId.phone
+      } : null,
+      rejectionReason: driver.rejectionReason || ''
+    }));
+
+    // Determine response message
+    let message = "Unapproved drivers fetched successfully";
+    if (franchiseId && unapprovedDrivers[0]?.franchiseId) {
+      message = `Unapproved drivers for franchise "${unapprovedDrivers[0].franchiseId.name}" fetched successfully`;
+    } else if (adminId) {
+      message = "All unapproved drivers fetched (Admin view)";
     }
 
     return res.status(200).json(
       new ApiResponse(
         200,
         {
-          drivers: unapprovedDrivers,
-          count: unapprovedDrivers.length, // Send the length of unapproved drivers
+          drivers: formattedDrivers,
+          count: unapprovedDrivers.length,
+          filters: {
+            franchiseId: franchiseId || null,
+            adminId: adminId || null
+          }
         },
-        "Unapproved drivers fetched successfully"
+        message
       )
     );
   } catch (error) {
     console.error("Error fetching unapproved drivers:", error.message);
-    return res
-      .status(500)
-      .json(new ApiResponse(500, null, "Failed to fetch unapproved drivers"));
+    return res.status(500).json(
+      new ApiResponse(500, null, "Failed to fetch unapproved drivers")
+    );
   }
 });
 
-// Get all rejected drivers (assuming they're marked with isApproved: false and have rejectionReason)
+// Get all rejected drivers (with admin/franchise access control)
 export const getRejectedDrivers = asyncHandler(async (req, res) => {
   try {
-    // Find drivers where isApproved is false AND has rejectionReason
-    const rejectedDrivers = await Driver.find({
+    const { adminId, franchiseId } = req.query;
+
+    // Validate IDs
+    if (adminId && !mongoose.Types.ObjectId.isValid(adminId)) {
+      return res.status(400).json(
+        new ApiResponse(400, null, "Invalid admin ID format")
+      );
+    }
+
+    if (franchiseId && !mongoose.Types.ObjectId.isValid(franchiseId)) {
+      return res.status(400).json(
+        new ApiResponse(400, null, "Invalid franchise ID format")
+      );
+    }
+
+    // Build query object for rejected drivers
+    const query = {
       isApproved: false,
-      rejectionReason: { $exists: true, $ne: "" },
-    });
+      rejectionReason: { $exists: true, $ne: "" }
+    };
+
+    // Apply franchise filter if franchiseId is provided
+    if (franchiseId) {
+      // Only show rejected drivers assigned to this specific franchise
+      query.franchiseId = franchiseId;
+      
+      // Optionally verify franchise exists
+      const franchise = await Franchise.findById(franchiseId);
+      if (!franchise) {
+        return res.status(404).json(
+          new ApiResponse(404, null, "Franchise not found")
+        );
+      }
+    } else if (adminId) {
+      // Admin can see all rejected drivers (both with and without franchise)
+      // No franchise filter applied
+      
+      // Optionally verify admin exists
+      const admin = await Admin.findById(adminId);
+      if (!admin) {
+        return res.status(404).json(
+          new ApiResponse(404, null, "Admin not found")
+        );
+      }
+    } else {
+      // If neither adminId nor franchiseId is provided, return error
+      return res.status(400).json(
+        new ApiResponse(400, null, "Either adminId or franchiseId is required")
+      );
+    }
+
+    // Find rejected drivers with optional population
+    const rejectedDrivers = await Driver.find(query)
+      .populate({
+        path: 'franchiseId',
+        select: 'name email phone'
+      })
+      .sort({ rejectedAt: -1 }); // Sort by rejection date (newest first)
 
     if (rejectedDrivers.length === 0) {
-      return res
-        .status(200)
-        .json(new ApiResponse(200, null, "No rejected drivers found"));
+      const message = franchiseId 
+        ? "No rejected drivers found for this franchise"
+        : "No rejected drivers found";
+      
+      return res.status(200).json(
+        new ApiResponse(200, { drivers: [], count: 0 }, message)
+      );
+    }
+
+    // Format response data
+    const formattedDrivers = rejectedDrivers.map(driver => ({
+      _id: driver._id,
+      userId: driver.userId,
+      name: driver.name,
+      phone: driver.phone,
+      email: driver.email,
+      license_number: driver.license_number,
+      pin_code: driver.pin_code,
+      isActive: driver.isActive,
+      isApproved: driver.isApproved,
+      createdAt: driver.createdAt,
+      franchise: driver.franchiseId ? {
+        _id: driver.franchiseId._id,
+        name: driver.franchiseId.name,
+        email: driver.franchiseId.email,
+        phone: driver.franchiseId.phone
+      } : null,
+      rejectionReason: driver.rejectionReason || '',
+      rejectedBy: driver.rejectedBy || '',
+      rejectedById: driver.rejectedById || null,
+      rejectedAt: driver.rejectedAt || null
+    }));
+
+    // Determine response message
+    let message = "Rejected drivers fetched successfully";
+    if (franchiseId && rejectedDrivers[0]?.franchiseId) {
+      message = `Rejected drivers for franchise "${rejectedDrivers[0].franchiseId.name}" fetched successfully`;
+    } else if (adminId) {
+      message = "All rejected drivers fetched (Admin view)";
     }
 
     return res.status(200).json(
       new ApiResponse(
         200,
         {
-          drivers: rejectedDrivers,
+          drivers: formattedDrivers,
           count: rejectedDrivers.length,
+          filters: {
+            franchiseId: franchiseId || null,
+            adminId: adminId || null
+          }
         },
-        "Rejected drivers fetched successfully"
+        message
       )
     );
   } catch (error) {
     console.error("Error fetching rejected drivers:", error.message);
-    return res
-      .status(500)
-      .json(new ApiResponse(500, null, "Failed to fetch rejected drivers"));
+    return res.status(500).json(
+      new ApiResponse(500, null, "Failed to fetch rejected drivers")
+    );
   }
 });
 
